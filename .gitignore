@@ -2,3 +2,4 @@
 /backups/
 /docs/
 .DS_Store
+.ace-tool/
