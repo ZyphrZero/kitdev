@@ -1,5 +1,13 @@
 use std::{path::PathBuf, process::Command};
 
+use anyhow::{Context, Result, bail};
+
+#[derive(Debug)]
+pub struct ShellCommandOutput {
+    pub stdout: String,
+    pub stderr: String,
+}
+
 pub fn command_path(command: &str) -> Option<PathBuf> {
     shell_output(&format!("command -v {command}"))
         .and_then(|path| path.lines().next().map(str::trim).map(PathBuf::from))
@@ -47,4 +55,26 @@ fn direct_output(command: &str, args: &[&str]) -> Option<String> {
     };
 
     text.lines().next().map(|line| line.trim().to_string())
+}
+
+pub fn run_shell_command(script: &str) -> Result<ShellCommandOutput> {
+    let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
+    let output = Command::new(&shell)
+        .args(["-ic", script])
+        .output()
+        .with_context(|| format!("failed to start shell command `{script}`"))?;
+    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+
+    if !output.status.success() {
+        let summary = if stderr.is_empty() { &stdout } else { &stderr };
+        bail!(
+            "command `{script}` failed with status {}{}{}",
+            output.status,
+            if summary.is_empty() { "" } else { ": " },
+            summary
+        );
+    }
+
+    Ok(ShellCommandOutput { stdout, stderr })
 }

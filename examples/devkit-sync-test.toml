@@ -1,3 +1,7 @@
+# Validation config for exercising `devkit sync`.
+# It keeps the main toolchain policy and adds one lightweight missing package
+# so `sync --dry-run` and `sync --yes` both have a real install path to test.
+
 [policy]
 channel = "stable"
 mirror = "ustc"
@@ -48,11 +52,11 @@ manager = "npm"
 
 [tools.cli]
 manager = "brew"
-packages = ["gh", "tmux"]
+packages = ["gh", "tmux", "yq"]
 
 [homebrew]
 mirror = "ustc"
-packages = ["fnm", "bun", "gh", "tmux"]
+packages = ["fnm", "bun", "gh", "tmux", "yq"]
 
 [npm]
 global_packages = ["wrangler"]

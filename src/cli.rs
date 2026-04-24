@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 
-use clap::{Parser, Subcommand};
+use clap::{ArgAction, Parser, Subcommand};
 
 #[derive(Parser, Debug)]
 #[command(name = "devkit")]
@@ -43,6 +43,25 @@ pub enum Commands {
         /// Skip package-manager and official latest-version queries.
         #[arg(long)]
         skip_latest: bool,
+    },
+
+    /// Plan how to bootstrap or repair a machine to match the configured toolchain.
+    Sync {
+        /// Preview actions only.
+        #[arg(long, action = ArgAction::SetTrue, conflicts_with = "yes")]
+        dry_run: bool,
+
+        /// Apply install, align, and managed shell-configuration steps.
+        #[arg(long, conflicts_with = "dry_run")]
+        yes: bool,
+
+        /// Print machine-readable JSON.
+        #[arg(long)]
+        json: bool,
+
+        /// Read desired toolchain state from a TOML config file.
+        #[arg(short, long, default_value = "devkit.toml")]
+        config: PathBuf,
     },
 
     /// Find old or conflicting toolchain leftovers.

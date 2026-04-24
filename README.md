@@ -8,6 +8,8 @@
 cargo run -- doctor
 cargo run -- doctor --json
 cargo run -- doctor --config examples/devkit.toml
+cargo run -- sync --dry-run --config examples/devkit.toml
+cargo run -- sync --yes --config examples/devkit.toml
 cargo run -- upgrade --dry-run --config examples/devkit.toml
 cargo run -- upgrade --dry-run --skip-latest --config examples/devkit.toml
 cargo run -- cleanup --dry-run
@@ -20,6 +22,18 @@ The MVP checks common macOS developer tools:
 - Homebrew / fnm / Node / npm / pnpm / Bun / Wrangler
 - uv / Rust / Cargo / Go
 - legacy leftovers such as `/usr/local/go`, `/usr/local/lib/node_modules`, and `~/.nvm`
+
+## Bootstrap planning
+
+`sync --dry-run` turns the current machine state plus `devkit.toml` policy into a bootstrap or repair plan. `sync --yes` applies install, align, and managed shell-configuration steps, then verifies the result with `doctor`.
+
+- install prerequisite managers such as Homebrew, `fnm`, `rustup`, and `uv`
+- align managed runtimes such as Node, Go, and Rust to policy
+- plan shell snippets for `fnm` and Go PATH setup
+- include configured Homebrew and npm CLI packages
+- execute managed shell snippets idempotently with `devkit` markers
+- keep cleanup steps manual even during `sync --yes`
+- end with a `doctor` verification step
 
 ## Latest-version providers
 
