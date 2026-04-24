@@ -1,0 +1,39 @@
+[tools.fnm]
+version = "latest"
+manager = "brew"
+
+[tools.node]
+version = "24.x"
+manager = "fnm"
+
+[tools.npm]
+version = "latest"
+manager = "npm"
+
+[tools.pnpm]
+version = "latest"
+manager = "corepack"
+
+[tools.bun]
+version = "latest"
+manager = "brew"
+
+[tools.go]
+version = "1.26.2"
+manager = "official"
+
+[tools.rustc]
+version = "stable"
+manager = "rustup"
+
+[tools.cargo]
+version = "stable"
+manager = "rustup"
+
+[tools.uv]
+version = "latest"
+manager = "standalone"
+
+[tools.wrangler]
+version = "latest"
+manager = "npm"

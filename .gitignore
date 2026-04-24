@@ -1,0 +1,4 @@
+/target/
+/backups/
+/docs/
+.DS_Store
