@@ -10,7 +10,7 @@ manager = "brew"
 [tools.node]
 version = "24.x"
 manager = "fnm"
-package_managers = ["npm", "pnpm", "bun"]
+package_managers = ["npm", "pnpm", "yarn", "bun"]
 
 [tools.npm]
 version = "latest"
@@ -20,7 +20,15 @@ manager = "npm"
 version = "latest"
 manager = "corepack"
 
+[tools.yarn]
+version = "stable"
+manager = "corepack"
+
 [tools.bun]
+version = "latest"
+manager = "brew"
+
+[tools.deno]
 version = "latest"
 manager = "brew"
 
@@ -42,6 +50,18 @@ manager = "rustup"
 version = "latest"
 manager = "standalone"
 
+[tools.python]
+version = "latest"
+manager = "brew"
+
+[tools.poetry]
+version = "latest"
+manager = "brew"
+
+[tools.ruby]
+version = "latest"
+manager = "brew"
+
 [tools.wrangler]
 version = "latest"
 manager = "npm"
@@ -52,7 +72,7 @@ packages = ["gh", "tmux"]
 
 [homebrew]
 mirror = "ustc"
-packages = ["fnm", "bun", "gh", "tmux"]
+packages = ["fnm", "bun", "deno", "python", "poetry", "ruby", "gh", "tmux"]
 
 [npm]
 global_packages = ["wrangler"]

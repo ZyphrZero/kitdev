@@ -1,9 +1,9 @@
 use std::{collections::BTreeMap, path::Path};
 
 use anyhow::{Context, Result};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Default, Clone, Deserialize, Serialize)]
 pub struct DevkitConfig {
     pub policy: Option<PolicyConfig>,
     pub tools: Option<BTreeMap<String, ToolPolicy>>,
@@ -11,7 +11,7 @@ pub struct DevkitConfig {
     pub npm: Option<NpmConfig>,
 }
 
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Default, Clone, Deserialize, Serialize)]
 pub struct PolicyConfig {
     pub channel: Option<String>,
     pub auto_fix: Option<bool>,
@@ -19,7 +19,7 @@ pub struct PolicyConfig {
     pub platform: Option<String>,
 }
 
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Default, Clone, Deserialize, Serialize)]
 pub struct ToolPolicy {
     pub version: Option<String>,
     pub manager: Option<String>,
@@ -31,13 +31,13 @@ pub struct ToolPolicy {
     pub install_dir: Option<String>,
 }
 
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Default, Clone, Deserialize, Serialize)]
 pub struct HomebrewConfig {
     pub mirror: Option<String>,
     pub packages: Option<Vec<String>>,
 }
 
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Default, Clone, Deserialize, Serialize)]
 pub struct NpmConfig {
     pub global_packages: Option<Vec<String>>,
 }

@@ -109,10 +109,13 @@ fn upgrade_note(tool: &ToolStatus, latest: Option<&LatestVersion>, target: Optio
 
 fn upgrade_command(tool: &ToolStatus, target: Option<&str>) -> Option<String> {
     match tool.name.as_str() {
-        "fnm" | "bun" | "brew" => Some(format!("brew upgrade {}", tool.name)),
+        "fnm" | "bun" | "deno" | "python" | "poetry" | "ruby" | "brew" => {
+            Some(format!("brew upgrade {}", tool.name))
+        }
         "node" => target.map(|version| format!("fnm install {version} && fnm default {version}")),
         "npm" => Some("npm install -g npm@latest".to_string()),
         "pnpm" => Some("corepack prepare pnpm@latest --activate".to_string()),
+        "yarn" => Some("corepack prepare yarn@stable --activate".to_string()),
         "wrangler" => Some("npm install -g wrangler@latest".to_string()),
         "uv" => Some("uv self update".to_string()),
         "rustup" | "rustc" | "cargo" => {

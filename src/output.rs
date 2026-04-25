@@ -1,8 +1,10 @@
 use anyhow::Result;
+use std::path::Path;
 
 use crate::{
     cleanup::CleanupPlan,
     doctor::{DoctorReport, Status},
+    install::{InstallExecution, InstallPlan, InstallStatus},
     sync::{SyncExecution, SyncPlan},
     upgrade::UpgradePlan,
 };
@@ -110,6 +112,85 @@ pub fn print_cleanup_plan(plan: &CleanupPlan, json: bool) -> Result<()> {
     Ok(())
 }
 
+pub fn print_init_document(content: &str) -> Result<()> {
+    print!("{content}");
+    Ok(())
+}
+
+pub fn print_init_result(path: &Path, overwritten: bool) -> Result<()> {
+    if overwritten {
+        println!("Overwrote {}", path.display());
+    } else {
+        println!("Wrote {}", path.display());
+    }
+    Ok(())
+}
+
+pub fn print_init_cancelled() -> Result<()> {
+    println!("Cancelled");
+    Ok(())
+}
+
+pub fn print_install_plan(plan: &InstallPlan, json: bool) -> Result<()> {
+    if json {
+        println!("{}", serde_json::to_string_pretty(plan)?);
+        return Ok(());
+    }
+
+    println!(
+        "Install plan{}:",
+        if plan.dry_run { " (dry-run)" } else { "" }
+    );
+    println!("target tool: {}", plan.tool);
+    for step in &plan.steps {
+        println!(
+            "- {} {}: {}",
+            format_kind(&step.kind),
+            step.target,
+            step.reason
+        );
+        print_step_command(step.command.as_deref(), step.manual);
+        if step.requires_sudo {
+            println!("  requires sudo: yes");
+        }
+    }
+
+    Ok(())
+}
+
+pub fn print_install_execution(execution: &InstallExecution, json: bool) -> Result<()> {
+    if json {
+        println!("{}", serde_json::to_string_pretty(execution)?);
+        return Ok(());
+    }
+
+    println!("Install execution:");
+    println!("target tool: {}", execution.tool);
+    for step in &execution.steps {
+        println!(
+            "- {} {}: {}",
+            format_execution_status(&step.status),
+            step.target,
+            step.detail
+        );
+        print_step_command(step.command.as_deref(), step.manual);
+    }
+    print_install_status(&execution.status);
+    let applied = execution
+        .steps
+        .iter()
+        .any(|step| matches!(step.status, crate::sync::SyncStepExecutionStatus::Applied));
+    if execution.succeeded && applied {
+        println!("result: install command completed");
+    } else if execution.succeeded {
+        println!("result: no install command needed");
+    } else {
+        println!("result: install command failed");
+    }
+
+    Ok(())
+}
+
 pub fn print_sync_plan(plan: &SyncPlan, json: bool) -> Result<()> {
     if json {
         println!("{}", serde_json::to_string_pretty(plan)?);
@@ -133,9 +214,7 @@ pub fn print_sync_plan(plan: &SyncPlan, json: bool) -> Result<()> {
             step.target,
             step.reason
         );
-        if let Some(command) = &step.command {
-            println!("  command: {command}");
-        }
+        print_step_command(step.command.as_deref(), step.manual);
         if let Some(file) = &step.file {
             println!("  file: {}", file.display());
         }
@@ -173,9 +252,7 @@ pub fn print_sync_execution(execution: &SyncExecution, json: bool) -> Result<()>
             step.target,
             step.detail
         );
-        if let Some(command) = &step.command {
-            println!("  command: {command}");
-        }
+        print_step_command(step.command.as_deref(), step.manual);
         if let Some(file) = &step.file {
             println!("  file: {}", file.display());
         }
@@ -187,6 +264,39 @@ pub fn print_sync_execution(execution: &SyncExecution, json: bool) -> Result<()>
     }
 
     Ok(())
+}
+
+fn print_install_status(status: &InstallStatus) {
+    match status {
+        InstallStatus::KnownTool(tool) => {
+            println!(
+                "detected: {} {} ({})",
+                tool.name,
+                tool.current.as_deref().unwrap_or("-"),
+                format_status(&tool.status)
+            );
+            if let Some(path) = &tool.path {
+                println!("path: {}", path.display());
+            }
+        }
+        InstallStatus::CommandVisible { command, path } => {
+            println!("detected: {command}");
+            println!("path: {}", path.display());
+        }
+        InstallStatus::CommandNotVisible { command } => {
+            println!("detected: {command} is not visible in PATH yet");
+        }
+    }
+}
+
+fn print_step_command(command: Option<&str>, manual: bool) {
+    if let Some(command) = command {
+        if manual {
+            println!("  instruction: {command}");
+        } else {
+            println!("  command: {command}");
+        }
+    }
 }
 
 fn format_status(status: &Status) -> &'static str {

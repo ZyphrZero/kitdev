@@ -12,6 +12,7 @@ use crate::{
     config::{DevkitConfig, ToolPolicy},
     doctor::{DoctorReport, Issue, IssueKind, Status, ToolStatus, build_doctor_report},
     shell::{command_path, run_shell_command},
+    tool_command::{ToolCommand, command_for_tool, homebrew_install_command},
 };
 
 #[derive(Debug, Clone, Copy, Serialize)]
@@ -43,6 +44,7 @@ pub struct SyncStep {
     pub command: Option<String>,
     pub file: Option<PathBuf>,
     pub snippet: Option<String>,
+    pub manual: bool,
     pub requires_sudo: bool,
 }
 
@@ -67,6 +69,7 @@ pub struct SyncStepExecution {
     pub detail: String,
     pub command: Option<String>,
     pub file: Option<PathBuf>,
+    pub manual: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -115,9 +118,10 @@ pub fn build_sync_plan(
                 kind: SyncStepKind::Install,
                 target: "Homebrew".to_string(),
                 reason: "install the package manager used by the configured toolchain".to_string(),
-                command: Some("/bin/bash -c \"$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)\"".to_string()),
+                command: Some(homebrew_install_command()),
                 file: None,
                 snippet: None,
+                manual: false,
                 requires_sudo: false,
             },
         );
@@ -227,6 +231,7 @@ pub fn build_sync_plan(
                     command: None,
                     file: Some(profile_path),
                     snippet: homebrew_mirror_snippet(&mirror),
+                    manual: false,
                     requires_sudo: false,
                 },
             );
@@ -250,6 +255,7 @@ pub fn build_sync_plan(
                 command: None,
                 file: Some(shell_rc_path()),
                 snippet: Some(format!("eval \"$(fnm env --use-on-cd --shell {shell})\"")),
+                manual: false,
                 requires_sudo: false,
             },
         );
@@ -270,6 +276,7 @@ pub fn build_sync_plan(
                 command: None,
                 file: Some(shell_rc_path()),
                 snippet: Some(format!("export PATH=\"{install_dir}/bin:$PATH\"")),
+                manual: false,
                 requires_sudo: false,
             },
         );
@@ -290,6 +297,7 @@ pub fn build_sync_plan(
             command: None,
             file: None,
             snippet: None,
+            manual: false,
             requires_sudo: false,
         });
     }
@@ -302,6 +310,7 @@ pub fn build_sync_plan(
         command: Some(format!("devkit doctor --config {}", config_path.display())),
         file: None,
         snippet: None,
+        manual: false,
         requires_sudo: false,
     });
 
@@ -326,6 +335,16 @@ pub fn execute_sync_plan(plan: &SyncPlan, config: &DevkitConfig) -> SyncExecutio
         }
 
         let execution = match step.kind {
+            SyncStepKind::Install | SyncStepKind::Align if step.manual => Ok(SyncStepExecution {
+                id: step.id.clone(),
+                kind: step.kind,
+                target: step.target.clone(),
+                status: SyncStepExecutionStatus::Skipped,
+                detail: "manual instruction not applied; review the suggested action".to_string(),
+                command: step.command.clone(),
+                file: step.file.clone(),
+                manual: step.manual,
+            }),
             SyncStepKind::Install | SyncStepKind::Align => execute_command_step(step),
             SyncStepKind::Configure => execute_configure_step(step),
             SyncStepKind::Cleanup => Ok(SyncStepExecution {
@@ -338,6 +357,7 @@ pub fn execute_sync_plan(plan: &SyncPlan, config: &DevkitConfig) -> SyncExecutio
                         .to_string(),
                 command: step.command.clone(),
                 file: step.file.clone(),
+                manual: step.manual,
             }),
             SyncStepKind::Info => Ok(SyncStepExecution {
                 id: step.id.clone(),
@@ -347,6 +367,7 @@ pub fn execute_sync_plan(plan: &SyncPlan, config: &DevkitConfig) -> SyncExecutio
                 detail: step.reason.clone(),
                 command: step.command.clone(),
                 file: step.file.clone(),
+                manual: step.manual,
             }),
             SyncStepKind::Verify => unreachable!(),
         };
@@ -363,6 +384,7 @@ pub fn execute_sync_plan(plan: &SyncPlan, config: &DevkitConfig) -> SyncExecutio
                     detail: error.to_string(),
                     command: step.command.clone(),
                     file: step.file.clone(),
+                    manual: step.manual,
                 });
                 break;
             }
@@ -413,6 +435,7 @@ fn execute_command_step(step: &SyncStep) -> Result<SyncStepExecution> {
         detail,
         command: step.command.clone(),
         file: step.file.clone(),
+        manual: step.manual,
     })
 }
 
@@ -436,6 +459,7 @@ fn execute_configure_step(step: &SyncStep) -> Result<SyncStepExecution> {
             },
             command: step.command.clone(),
             file: step.file.clone(),
+            manual: step.manual,
         });
     }
 
@@ -449,6 +473,7 @@ fn execute_configure_step(step: &SyncStep) -> Result<SyncStepExecution> {
                 .to_string(),
             command: step.command.clone(),
             file: step.file.clone(),
+            manual: step.manual,
         });
     }
 
@@ -460,6 +485,7 @@ fn execute_configure_step(step: &SyncStep) -> Result<SyncStepExecution> {
         detail: step.reason.clone(),
         command: step.command.clone(),
         file: step.file.clone(),
+        manual: step.manual,
     })
 }
 
@@ -498,6 +524,7 @@ fn build_verify_result(
         detail,
         command: step.command.clone(),
         file: step.file.clone(),
+        manual: step.manual,
     }
 }
 
@@ -560,6 +587,7 @@ fn rust_sync_step(config: &DevkitConfig, tools: &BTreeMap<&str, &ToolStatus>) ->
         command: Some(command),
         file: None,
         snippet: None,
+        manual: false,
         requires_sudo: false,
     })
 }
@@ -575,18 +603,24 @@ fn tool_sync_step(
     }
 
     let missing = matches!(tool.status, Status::Missing);
+    let install = missing || manager_path_mismatch(tool, policy);
+    let (command, manual) = sync_command_for_tool(name, policy, install)
+        .map(ToolCommand::into_step_parts)
+        .unwrap_or((None, false));
+
     Some(SyncStep {
         id: format!("tool:{name}"),
-        kind: if missing {
+        kind: if install {
             SyncStepKind::Install
         } else {
             SyncStepKind::Align
         },
         target: name.to_string(),
         reason: tool_sync_reason(tool),
-        command: sync_command_for_tool(name, policy, missing),
+        command,
         file: None,
         snippet: None,
+        manual,
         requires_sudo: false,
     })
 }
@@ -601,6 +635,11 @@ fn package_manager_step(name: &str, tools: &BTreeMap<&str, &ToolStatus>) -> Opti
         return None;
     }
 
+    let (command, manual) =
+        sync_command_for_tool(name, &ToolPolicy::default(), is_tool_missing(tool))
+            .map(ToolCommand::into_step_parts)
+            .unwrap_or((None, false));
+
     Some(SyncStep {
         id: format!("tool:{name}"),
         kind: if is_tool_missing(tool) {
@@ -614,9 +653,10 @@ fn package_manager_step(name: &str, tools: &BTreeMap<&str, &ToolStatus>) -> Opti
         } else {
             format!("align {name} with the configured Node workflow")
         },
-        command: sync_command_for_tool(name, &ToolPolicy::default(), is_tool_missing(tool)),
+        command,
         file: None,
         snippet: None,
+        manual,
         requires_sudo: false,
     })
 }
@@ -641,6 +681,7 @@ fn package_step(package: &str, manager: Option<&str>) -> Option<SyncStep> {
         command,
         file: None,
         snippet: None,
+        manual: false,
         requires_sudo: false,
     })
 }
@@ -660,6 +701,7 @@ fn issue_step(issue: &Issue) -> Option<SyncStep> {
             command: issue.fix.clone(),
             file: None,
             snippet: None,
+            manual: false,
             requires_sudo: false,
         }),
         IssueKind::LegacyInstall => Some(SyncStep {
@@ -674,81 +716,45 @@ fn issue_step(issue: &Issue) -> Option<SyncStep> {
             command: issue.fix.clone(),
             file: issue.path.clone(),
             snippet: None,
+            manual: false,
             requires_sudo: issue.fix.as_ref().is_some_and(|fix| fix.contains("sudo ")),
         }),
     }
 }
 
-fn sync_command_for_tool(name: &str, policy: &ToolPolicy, missing: bool) -> Option<String> {
-    let manager = policy.manager.as_deref().unwrap_or_default();
-    match name {
-        "brew" => {
-            if missing {
-                Some("/bin/bash -c \"$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)\"".to_string())
-            } else {
-                Some("brew update && brew upgrade".to_string())
-            }
-        }
-        "fnm" => Some(if missing {
-            "brew install fnm".to_string()
-        } else {
-            "brew upgrade fnm".to_string()
-        }),
-        "node" => match manager {
-            "fnm" | "" => {
-                let version = node_selector(policy.version.as_deref());
-                Some(format!("fnm install {version} && fnm default {version}"))
-            }
-            "brew" | "homebrew" => Some("brew install node".to_string()),
-            _ => None,
-        },
-        "npm" => Some("npm install -g npm@latest".to_string()),
-        "pnpm" => Some("corepack enable && corepack prepare pnpm@latest --activate".to_string()),
-        "bun" => Some(
-            if manager == "brew" || manager == "homebrew" || manager.is_empty() {
-                if missing {
-                    "brew install oven-sh/bun/bun".to_string()
-                } else {
-                    "brew upgrade oven-sh/bun/bun".to_string()
-                }
-            } else {
-                "bun upgrade".to_string()
-            },
-        ),
-        "wrangler" => Some("npm install -g wrangler@latest".to_string()),
-        "uv" => Some(if missing {
-            "curl -LsSf https://astral.sh/uv/install.sh | sh".to_string()
-        } else {
-            "uv self update".to_string()
-        }),
-        "go" => {
-            let version = policy
-                .version
-                .clone()
-                .unwrap_or_else(|| "stable".to_string());
-            let install_dir = policy
-                .install_dir
-                .clone()
-                .unwrap_or_else(|| "~/.local/opt/go/current".to_string());
-            let source = policy.source.as_deref().unwrap_or(manager);
-            if matches!(source, "brew" | "homebrew") {
-                Some("brew install go".to_string())
-            } else {
-                Some(format!(
-                    "install Go {version} from https://go.dev/dl/ into {install_dir}"
-                ))
-            }
-        }
-        _ => None,
+fn sync_command_for_tool(name: &str, policy: &ToolPolicy, missing: bool) -> Option<ToolCommand> {
+    match command_for_tool(name, policy, missing) {
+        Ok(command) => Some(command),
+        Err(error) => Some(ToolCommand::Manual(error.to_string())),
     }
 }
 
 fn tool_sync_reason(tool: &ToolStatus) -> String {
     match tool.status {
         Status::Missing => "tool is required by policy but not installed".to_string(),
+        Status::Mismatch
+            if tool.note.as_deref() == Some("installed path does not match configured manager") =>
+        {
+            "installed tool does not match the configured manager".to_string()
+        }
         Status::Mismatch => "installed tool does not match the configured policy".to_string(),
         Status::Unknown => "tool is present but its version could not be detected".to_string(),
         Status::Ok => "tool already matches the configured policy".to_string(),
+    }
+}
+
+fn manager_path_mismatch(tool: &ToolStatus, policy: &ToolPolicy) -> bool {
+    let Some(manager) = policy.manager.as_deref() else {
+        return false;
+    };
+    let Some(path) = &tool.path else {
+        return false;
+    };
+    let path = path.to_string_lossy();
+    match manager {
+        "brew" | "homebrew" => !(path.contains("/opt/homebrew/") || path.contains("/usr/local/")),
+        "fnm" => !path.contains("fnm"),
+        _ => false,
     }
 }
 
@@ -802,18 +808,6 @@ fn go_install_dir(config: &DevkitConfig) -> Option<String> {
         .as_ref()
         .and_then(|tools| tools.get("go"))
         .and_then(|policy| policy.install_dir.clone())
-}
-
-fn node_selector(version: Option<&str>) -> String {
-    match version {
-        Some("latest") => "latest".to_string(),
-        Some("stable") => "lts-latest".to_string(),
-        Some(version) => version
-            .trim_start_matches('v')
-            .trim_end_matches(".x")
-            .to_string(),
-        None => "lts-latest".to_string(),
-    }
 }
 
 fn current_shell_name() -> &'static str {
@@ -1198,6 +1192,43 @@ mod tests {
 
         assert_eq!(rust_steps.len(), 1);
         assert!(matches!(rust_steps[0].kind, SyncStepKind::Align));
+    }
+
+    #[test]
+    fn official_go_sync_step_is_manual_instruction() {
+        let config = DevkitConfig {
+            policy: None,
+            tools: Some(
+                [(
+                    "go".to_string(),
+                    ToolPolicy {
+                        version: Some("1.26.2".to_string()),
+                        manager: Some("official".to_string()),
+                        source: Some("official".to_string()),
+                        install_dir: Some("~/.local/opt/go/current".to_string()),
+                        ..ToolPolicy::default()
+                    },
+                )]
+                .into_iter()
+                .collect(),
+            ),
+            homebrew: None,
+            npm: None,
+        };
+        let report = DoctorReport {
+            tools: vec![missing_tool("go")],
+            issues: vec![],
+        };
+
+        let plan = build_sync_plan(true, Path::new("devkit.toml"), &config, &report);
+        let go_step = plan.steps.iter().find(|step| step.id == "tool:go").unwrap();
+
+        assert!(matches!(go_step.kind, SyncStepKind::Install));
+        assert!(go_step.manual);
+        assert_eq!(
+            go_step.command.as_deref(),
+            Some("install Go 1.26.2 from https://go.dev/dl/ into ~/.local/opt/go/current")
+        );
     }
 
     #[test]

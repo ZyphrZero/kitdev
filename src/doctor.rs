@@ -83,10 +83,22 @@ const TOOL_SPECS: &[ToolSpec] = &[
         version_prefix: None,
     },
     ToolSpec {
+        name: "yarn",
+        command: "yarn",
+        version_args: &["--version"],
+        version_prefix: None,
+    },
+    ToolSpec {
         name: "bun",
         command: "bun",
         version_args: &["--version"],
         version_prefix: None,
+    },
+    ToolSpec {
+        name: "deno",
+        command: "deno",
+        version_args: &["--version"],
+        version_prefix: Some("deno "),
     },
     ToolSpec {
         name: "wrangler",
@@ -99,6 +111,24 @@ const TOOL_SPECS: &[ToolSpec] = &[
         command: "uv",
         version_args: &["--version"],
         version_prefix: Some("uv "),
+    },
+    ToolSpec {
+        name: "python",
+        command: "python3",
+        version_args: &["--version"],
+        version_prefix: Some("Python "),
+    },
+    ToolSpec {
+        name: "poetry",
+        command: "poetry",
+        version_args: &["--version"],
+        version_prefix: Some("Poetry (version "),
+    },
+    ToolSpec {
+        name: "ruby",
+        command: "ruby",
+        version_args: &["--version"],
+        version_prefix: Some("ruby "),
     },
     ToolSpec {
         name: "rustup",
@@ -155,18 +185,25 @@ fn inspect_tool(spec: &ToolSpec, config: &DevkitConfig) -> ToolStatus {
         .as_deref()
         .map(|version| normalize_version(version, spec.version_prefix));
 
-    let status = match (&path, &normalized, &required) {
-        (None, _, _) => Status::Missing,
-        (Some(_), Some(current), Some(required)) if version_satisfies(current, required) => {
+    let manager_matches = path
+        .as_ref()
+        .is_none_or(|path| manager_matches_path(manager.as_deref(), path));
+    let status = match (&path, &normalized, &required, manager_matches) {
+        (None, _, _, _) => Status::Missing,
+        (Some(_), _, _, false) => Status::Mismatch,
+        (Some(_), Some(current), Some(required), true) if version_satisfies(current, required) => {
             Status::Ok
         }
-        (Some(_), Some(_), Some(_)) => Status::Mismatch,
-        (Some(_), Some(_), None) => Status::Ok,
-        (Some(_), None, _) => Status::Unknown,
+        (Some(_), Some(_), Some(_), true) => Status::Mismatch,
+        (Some(_), Some(_), None, true) => Status::Ok,
+        (Some(_), None, _, true) => Status::Unknown,
     };
 
     let note = match status {
         Status::Missing => Some("command not found in PATH".to_string()),
+        Status::Mismatch if !manager_matches => {
+            Some("installed path does not match configured manager".to_string())
+        }
         Status::Mismatch => Some("installed version does not match configured policy".to_string()),
         Status::Unknown => Some("installed, but version could not be detected".to_string()),
         Status::Ok => None,
@@ -184,6 +221,17 @@ fn inspect_tool(spec: &ToolSpec, config: &DevkitConfig) -> ToolStatus {
     }
 }
 
+fn manager_matches_path(manager: Option<&str>, path: &Path) -> bool {
+    let path = path.to_string_lossy();
+    match manager {
+        Some("brew" | "homebrew") => {
+            path.contains("/opt/homebrew/") || path.contains("/usr/local/")
+        }
+        Some("fnm") => path.contains("fnm"),
+        _ => true,
+    }
+}
+
 pub fn normalize_version(raw: &str, prefix: Option<&str>) -> String {
     let mut value = raw.trim().to_string();
     if let Some(prefix) = prefix {
@@ -195,6 +243,7 @@ pub fn normalize_version(raw: &str, prefix: Option<&str>) -> String {
         .next()
         .unwrap_or(value.as_str())
         .trim_start_matches('v')
+        .trim_end_matches(')')
         .to_string()
 }
 
@@ -226,7 +275,7 @@ fn detect_issues(tools: &[ToolStatus]) -> Vec<Issue> {
                 kind: IssueKind::MissingTool,
                 path: None,
                 message: format!("{} is not available in PATH", tool.name),
-                fix: suggested_install(&tool.name),
+                fix: suggested_install(tool),
             });
         }
     }
@@ -274,16 +323,35 @@ fn detect_issues(tools: &[ToolStatus]) -> Vec<Issue> {
     issues
 }
 
-fn suggested_install(name: &str) -> Option<String> {
-    match name {
-        "fnm" => Some("brew install fnm".to_string()),
-        "node" => Some("fnm install --lts && fnm default lts-latest".to_string()),
-        "pnpm" => Some("corepack enable && corepack prepare pnpm@latest --activate".to_string()),
-        "bun" => Some("brew install oven-sh/bun/bun".to_string()),
-        "uv" => Some("curl -LsSf https://astral.sh/uv/install.sh | sh".to_string()),
-        "rustup" | "rustc" | "cargo" => Some("curl https://sh.rustup.rs -sSf | sh".to_string()),
-        "go" => Some("install from https://go.dev/dl/ or brew install go".to_string()),
-        "brew" => Some("install Homebrew from https://brew.sh".to_string()),
+fn suggested_install(tool: &ToolStatus) -> Option<String> {
+    match (tool.name.as_str(), tool.manager.as_deref()) {
+        ("fnm", _) => Some("brew install fnm".to_string()),
+        ("node", Some("brew" | "homebrew")) => Some("brew install node".to_string()),
+        ("node", _) => Some("fnm install --lts && fnm default lts-latest".to_string()),
+        ("pnpm", _) => {
+            Some("corepack enable && corepack prepare pnpm@latest --activate".to_string())
+        }
+        ("yarn", _) => {
+            Some("corepack enable && corepack prepare yarn@stable --activate".to_string())
+        }
+        ("bun", _) => Some("brew install oven-sh/bun/bun".to_string()),
+        ("deno", Some("standalone")) => {
+            Some("curl -fsSL https://deno.land/install.sh | sh".to_string())
+        }
+        ("deno", _) => Some("brew install deno".to_string()),
+        ("uv", _) => Some("curl -LsSf https://astral.sh/uv/install.sh | sh".to_string()),
+        ("python", Some("uv")) => Some("uv python install".to_string()),
+        ("python", _) => Some("brew install python".to_string()),
+        ("poetry", Some("official")) => {
+            Some("curl -sSL https://install.python-poetry.org | python3 -".to_string())
+        }
+        ("poetry", _) => Some("brew install poetry".to_string()),
+        ("ruby", _) => Some("brew install ruby".to_string()),
+        ("rustup" | "rustc" | "cargo", _) => {
+            Some("curl https://sh.rustup.rs -sSf | sh".to_string())
+        }
+        ("go", _) => Some("install from https://go.dev/dl/ or brew install go".to_string()),
+        ("brew", _) => Some("install Homebrew from https://brew.sh".to_string()),
         _ => None,
     }
 }
@@ -341,6 +409,10 @@ mod tests {
         assert_eq!(
             normalize_version("rustc 1.95.0 (59807616e 2026-04-14)", Some("rustc ")),
             "1.95.0"
+        );
+        assert_eq!(
+            normalize_version("Poetry (version 2.3.1)", Some("Poetry (version ")),
+            "2.3.1"
         );
     }
 

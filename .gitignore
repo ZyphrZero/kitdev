@@ -1,5 +1,6 @@
 /target/
 /backups/
-/docs/
+/docs/*
 .DS_Store
 .ace-tool/
+.omx/
