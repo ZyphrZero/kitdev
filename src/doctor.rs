@@ -192,7 +192,11 @@ pub fn build_doctor_report(config: &DevkitConfig) -> DoctorReport {
     let platform = OperatingSystem::current();
     let tools = TOOL_SPECS
         .iter()
-        .filter(|spec| should_inspect_tool(spec, config, platform))
+        .filter(|spec| {
+            should_inspect_tool(spec, config, platform, |command| {
+                command_path(command).is_some()
+            })
+        })
         .map(|spec| inspect_tool(spec, config))
         .collect::<Vec<_>>();
     let issues = detect_issues(&tools, config, platform);
@@ -200,11 +204,22 @@ pub fn build_doctor_report(config: &DevkitConfig) -> DoctorReport {
     DoctorReport { tools, issues }
 }
 
-fn should_inspect_tool(spec: &ToolSpec, config: &DevkitConfig, platform: OperatingSystem) -> bool {
+fn should_inspect_tool(
+    spec: &ToolSpec,
+    config: &DevkitConfig,
+    platform: OperatingSystem,
+    command_exists: impl Fn(&str) -> bool,
+) -> bool {
+    if tool_policy(config, spec.name).is_some()
+        || command_exists(spec.command)
+        || tool_is_policy_dependency(spec.name, config)
+    {
+        return true;
+    }
+
     match spec.name {
         "brew" => {
             platform.is_macos()
-                || command_path("brew").is_some()
                 || config_references_manager(config, &["brew", "homebrew"])
                 || config
                     .homebrew
@@ -212,17 +227,13 @@ fn should_inspect_tool(spec: &ToolSpec, config: &DevkitConfig, platform: Operati
                     .and_then(|homebrew| homebrew.packages.as_ref())
                     .is_some_and(|packages| !packages.is_empty())
         }
-        "winget" => {
-            platform.is_windows()
-                || command_path("winget").is_some()
-                || config_references_manager(config, &["winget"])
-        }
-        _ => true,
+        "winget" => platform.is_windows() || config_references_manager(config, &["winget"]),
+        _ => false,
     }
 }
 
 fn inspect_tool(spec: &ToolSpec, config: &DevkitConfig) -> ToolStatus {
-    let policy = config.tools.as_ref().and_then(|tools| tools.get(spec.name));
+    let policy = tool_policy(config, spec.name);
     let required = policy.and_then(|policy| policy.version.clone());
     let manager = policy.and_then(|policy| policy.manager.clone());
 
@@ -269,6 +280,55 @@ fn inspect_tool(spec: &ToolSpec, config: &DevkitConfig) -> ToolStatus {
         manager,
         status,
         note,
+    }
+}
+
+fn tool_policy<'a>(config: &'a DevkitConfig, name: &str) -> Option<&'a ToolPolicy> {
+    config.tools.as_ref().and_then(|tools| {
+        tools.get(name).or_else(|| match name {
+            "rustup" | "rustc" | "cargo" => tools.get("rust"),
+            _ => None,
+        })
+    })
+}
+
+fn tool_is_policy_dependency(name: &str, config: &DevkitConfig) -> bool {
+    let Some(tools) = config.tools.as_ref() else {
+        return false;
+    };
+
+    match name {
+        "fnm" => tools
+            .get("node")
+            .and_then(|policy| policy.manager.as_deref())
+            .is_some_and(|manager| manager == "fnm"),
+        "npm" => {
+            tools
+                .get("wrangler")
+                .and_then(|policy| policy.manager.as_deref())
+                .is_some_and(|manager| manager == "npm")
+                || tools
+                    .get("node")
+                    .and_then(|policy| policy.package_managers.as_ref())
+                    .is_some_and(|managers| managers.iter().any(|manager| manager == "npm"))
+                || config
+                    .npm
+                    .as_ref()
+                    .and_then(|npm| npm.global_packages.as_ref())
+                    .is_some_and(|packages| !packages.is_empty())
+        }
+        "pnpm" | "yarn" | "bun" => tools
+            .get("node")
+            .and_then(|policy| policy.package_managers.as_ref())
+            .is_some_and(|managers| managers.iter().any(|manager| manager == name)),
+        "uv" => tools
+            .get("python")
+            .and_then(|policy| policy.manager.as_deref())
+            .is_some_and(|manager| manager == "uv"),
+        "rustup" | "rustc" | "cargo" => ["rust", "rustup", "rustc", "cargo"]
+            .iter()
+            .any(|tool| tools.contains_key(*tool)),
+        _ => false,
     }
 }
 
@@ -528,11 +588,15 @@ fn policy_platform_matches_current(policy_platform: &str, platform: OperatingSys
 mod tests {
     use std::path::PathBuf;
 
-    use crate::platform::OperatingSystem;
+    use crate::{
+        config::{DevkitConfig, ToolPolicy},
+        platform::OperatingSystem,
+    };
 
     use super::{
-        IssueKind, IssueSeverity, Status, ToolStatus, detect_path_conflicts, manager_matches_path,
-        normalize_version, suggested_install, version_satisfies,
+        IssueKind, IssueSeverity, Status, TOOL_SPECS, ToolStatus, detect_path_conflicts,
+        manager_matches_path, normalize_version, should_inspect_tool, suggested_install,
+        version_satisfies,
     };
 
     #[test]
@@ -572,6 +636,53 @@ mod tests {
         assert!(!manager_matches_path(
             Some("nvm"),
             std::path::Path::new("/opt/homebrew/bin/node")
+        ));
+    }
+
+    #[test]
+    fn skips_missing_unconfigured_tools() {
+        let deno = TOOL_SPECS.iter().find(|spec| spec.name == "deno").unwrap();
+        let config = DevkitConfig::default();
+
+        assert!(!should_inspect_tool(
+            deno,
+            &config,
+            OperatingSystem::Macos,
+            |_| false
+        ));
+    }
+
+    #[test]
+    fn inspects_configured_or_installed_tools() {
+        let deno = TOOL_SPECS.iter().find(|spec| spec.name == "deno").unwrap();
+        let config = DevkitConfig {
+            tools: Some(
+                std::iter::once((
+                    "deno".to_string(),
+                    ToolPolicy {
+                        version: Some("latest".to_string()),
+                        manager: Some("brew".to_string()),
+                        ..ToolPolicy::default()
+                    },
+                ))
+                .collect(),
+            ),
+            ..DevkitConfig::default()
+        };
+
+        assert!(should_inspect_tool(
+            deno,
+            &config,
+            OperatingSystem::Macos,
+            |_| false
+        ));
+
+        let config = DevkitConfig::default();
+        assert!(should_inspect_tool(
+            deno,
+            &config,
+            OperatingSystem::Macos,
+            |command| command == "deno"
         ));
     }
 

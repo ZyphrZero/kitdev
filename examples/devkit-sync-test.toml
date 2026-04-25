@@ -1,6 +1,6 @@
 # Validation config for exercising `devkit sync`.
 # It keeps the main toolchain policy and adds one lightweight missing package
-# so `sync --dry-run` and `sync --yes` both have a real install path to test.
+# so `sync --dry-run` and `sync --apply` both have a real install path to test.
 
 [policy]
 channel = "stable"

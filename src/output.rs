@@ -5,34 +5,40 @@ use crate::{
     cleanup::CleanupPlan,
     config::{ConfigExplainReport, ConfigValidationLevel, ConfigValidationReport},
     doctor::{DoctorReport, IssueSeverity, Status},
+    i18n::{Label, Messages, Text},
     install::{InstallExecution, InstallPlan, InstallStatus},
     sync::{SyncExecution, SyncPlan},
     upgrade::UpgradePlan,
 };
 
-pub fn print_config_validation_report(report: &ConfigValidationReport, json: bool) -> Result<()> {
+pub fn print_config_validation_report(
+    report: &ConfigValidationReport,
+    json: bool,
+    messages: &Messages,
+) -> Result<()> {
     if json {
         println!("{}", serde_json::to_string_pretty(report)?);
         return Ok(());
     }
 
     if report.items.is_empty() {
-        println!("Config validation: ok");
+        println!("{}", messages.text(Text::ConfigValidationOk));
         return Ok(());
     }
 
     println!(
-        "Config validation: {}",
+        "{}: {}",
+        messages.text(Text::ConfigValidation),
         if report.has_errors() {
-            "errors found"
+            messages.text(Text::ErrorsFound)
         } else {
-            "warnings only"
+            messages.text(Text::WarningsOnly)
         }
     );
     for item in &report.items {
         println!(
             "- {} {}: {}",
-            format_config_validation_level(item.level),
+            format_config_validation_level(item.level, messages),
             item.path,
             item.message
         );
@@ -41,26 +47,42 @@ pub fn print_config_validation_report(report: &ConfigValidationReport, json: boo
     Ok(())
 }
 
-pub fn print_config_explain_report(report: &ConfigExplainReport, json: bool) -> Result<()> {
+pub fn print_config_explain_report(
+    report: &ConfigExplainReport,
+    json: bool,
+    messages: &Messages,
+) -> Result<()> {
     if json {
         println!("{}", serde_json::to_string_pretty(report)?);
         return Ok(());
     }
 
-    println!("Config explain:");
-    println!("platform: {}", report.platform);
+    println!("{}:", messages.text(Text::ConfigExplain));
+    println!("{}: {}", messages.text(Text::Platform), report.platform);
     if report.applied_overrides.is_empty() {
-        println!("applied overrides: none");
+        println!(
+            "{}: {}",
+            messages.text(Text::AppliedOverrides),
+            messages.text(Text::None)
+        );
     } else {
-        println!("applied overrides: {}", report.applied_overrides.join(", "));
+        println!(
+            "{}: {}",
+            messages.text(Text::AppliedOverrides),
+            report.applied_overrides.join(", ")
+        );
     }
 
     if report.entries.is_empty() {
-        println!("entries: none");
+        println!(
+            "{}: {}",
+            messages.text(Text::Entries),
+            messages.text(Text::None)
+        );
         return Ok(());
     }
 
-    println!("entries:");
+    println!("{}:", messages.text(Text::Entries));
     for entry in &report.entries {
         println!("- {} = {} ({})", entry.path, entry.value, entry.source);
     }
@@ -68,13 +90,20 @@ pub fn print_config_explain_report(report: &ConfigExplainReport, json: bool) -> 
     Ok(())
 }
 
-pub fn print_doctor_report(report: &DoctorReport, json: bool) -> Result<()> {
+pub fn print_doctor_report(report: &DoctorReport, json: bool, messages: &Messages) -> Result<()> {
     if json {
         println!("{}", serde_json::to_string_pretty(report)?);
         return Ok(());
     }
 
-    println!("Tool       Current        Required       Status      Path");
+    println!(
+        "{:<9}  {:<13}  {:<13}  {:<10}  {}",
+        messages.text(Text::Tool),
+        messages.text(Text::Current),
+        messages.text(Text::Required),
+        messages.text(Text::Status),
+        messages.text(Text::Path)
+    );
     println!("---------  -------------  -------------  ----------  ----");
     for tool in &report.tools {
         println!(
@@ -82,7 +111,7 @@ pub fn print_doctor_report(report: &DoctorReport, json: bool) -> Result<()> {
             tool.name,
             tool.current.as_deref().unwrap_or("-"),
             tool.required.as_deref().unwrap_or("-"),
-            format_status(&tool.status),
+            format_status(&tool.status, messages),
             tool.path
                 .as_ref()
                 .map(|path| path.display().to_string())
@@ -90,7 +119,8 @@ pub fn print_doctor_report(report: &DoctorReport, json: bool) -> Result<()> {
         );
         if tool.path_candidates.len() > 1 {
             println!(
-                "           PATH candidates: {}",
+                "           {}: {}",
+                messages.text(Text::PathCandidates),
                 tool.path_candidates
                     .iter()
                     .map(|path| path.display().to_string())
@@ -102,21 +132,21 @@ pub fn print_doctor_report(report: &DoctorReport, json: bool) -> Result<()> {
 
     if !report.issues.is_empty() {
         println!();
-        println!("Issues:");
+        println!("{}:", messages.text(Text::Issues));
         for issue in &report.issues {
             println!(
                 "- [{}] {}",
-                format_issue_severity(issue.severity),
+                format_issue_severity(issue.severity, messages),
                 issue.message
             );
             if let Some(path) = &issue.path {
-                println!("  path: {}", path.display());
+                println!("  {}: {}", messages.text(Text::Path), path.display());
             }
             for evidence in &issue.evidence {
                 println!("  {}: {}", evidence.key, evidence.value);
             }
             if let Some(fix) = &issue.fix {
-                println!("  fix: {fix}");
+                println!("  {}: {fix}", messages.text(Text::Fix));
             }
         }
     }
@@ -124,17 +154,18 @@ pub fn print_doctor_report(report: &DoctorReport, json: bool) -> Result<()> {
     Ok(())
 }
 
-pub fn print_upgrade_plan(plan: &UpgradePlan, json: bool) -> Result<()> {
+pub fn print_upgrade_plan(plan: &UpgradePlan, json: bool, messages: &Messages) -> Result<()> {
     if json {
         println!("{}", serde_json::to_string_pretty(plan)?);
         return Ok(());
     }
 
     println!(
-        "Upgrade plan{}{}:",
-        if plan.dry_run { " (dry-run)" } else { "" },
+        "{}{}{}:",
+        messages.text(Text::UpgradePlan),
+        messages.dry_run_suffix(plan.dry_run),
         if plan.checked_latest {
-            " with latest checks"
+            messages.text(Text::WithLatestChecks)
         } else {
             ""
         }
@@ -142,46 +173,47 @@ pub fn print_upgrade_plan(plan: &UpgradePlan, json: bool) -> Result<()> {
     for candidate in &plan.candidates {
         println!("- {}: {}", candidate.tool, candidate.note);
         if let Some(current) = &candidate.current {
-            println!("  current: {current}");
+            println!("  {}: {current}", messages.text(Text::Current));
         }
         if let Some(required) = &candidate.required {
-            println!("  required: {required}");
+            println!("  {}: {required}", messages.text(Text::Required));
         }
         if let Some(latest) = &candidate.latest {
             println!("  latest: {latest}");
         }
         if let Some(source) = &candidate.latest_source {
-            println!("  source: {source}");
+            println!("  {}: {source}", messages.text(Text::Source));
         }
         if let Some(command) = &candidate.command {
-            println!("  command: {command}");
+            println!("  {}: {command}", messages.text(Text::Command));
         }
     }
 
     Ok(())
 }
 
-pub fn print_cleanup_plan(plan: &CleanupPlan, json: bool) -> Result<()> {
+pub fn print_cleanup_plan(plan: &CleanupPlan, json: bool, messages: &Messages) -> Result<()> {
     if json {
         println!("{}", serde_json::to_string_pretty(plan)?);
         return Ok(());
     }
 
     println!(
-        "Cleanup plan{}:",
-        if plan.dry_run { " (dry-run)" } else { "" }
+        "{}{}:",
+        messages.text(Text::CleanupPlan),
+        messages.dry_run_suffix(plan.dry_run)
     );
     if plan.items.is_empty() {
-        println!("- no known legacy toolchain leftovers found");
+        println!("- {}", messages.text(Text::NoLegacyLeftovers));
         return Ok(());
     }
 
     for item in &plan.items {
         println!("- {}", item.reason);
-        println!("  path: {}", item.path.display());
-        println!("  command: {}", item.command);
+        println!("  {}: {}", messages.text(Text::Path), item.path.display());
+        println!("  {}: {}", messages.text(Text::Command), item.command);
         if item.requires_sudo {
-            println!("  requires sudo: yes");
+            println!("  {}", messages.text(Text::RequiresSudoYes));
         }
     }
 
@@ -193,97 +225,118 @@ pub fn print_init_document(content: &str) -> Result<()> {
     Ok(())
 }
 
-pub fn print_init_result(path: &Path, overwritten: bool) -> Result<()> {
+pub fn print_init_result(path: &Path, overwritten: bool, messages: &Messages) -> Result<()> {
     if overwritten {
-        println!("Overwrote {}", path.display());
+        println!("{} {}", messages.text(Text::Overwrote), path.display());
     } else {
-        println!("Wrote {}", path.display());
+        println!("{} {}", messages.text(Text::Wrote), path.display());
     }
     Ok(())
 }
 
-pub fn print_init_cancelled() -> Result<()> {
-    println!("Cancelled");
+pub fn print_init_cancelled(messages: &Messages) -> Result<()> {
+    println!("{}", messages.text(Text::Cancelled));
     Ok(())
 }
 
-pub fn print_install_plan(plan: &InstallPlan, json: bool) -> Result<()> {
+pub fn print_install_plan(plan: &InstallPlan, json: bool, messages: &Messages) -> Result<()> {
     if json {
         println!("{}", serde_json::to_string_pretty(plan)?);
         return Ok(());
     }
 
     println!(
-        "Install plan{}:",
-        if plan.dry_run { " (dry-run)" } else { "" }
+        "{}{}:",
+        messages.text(Text::InstallPlan),
+        messages.dry_run_suffix(plan.dry_run)
     );
-    println!("target tool: {}", plan.tool);
+    println!("{}: {}", messages.text(Text::TargetTool), plan.tool);
     for step in &plan.steps {
         println!(
             "- {} {}: {}",
-            format_kind(&step.kind),
+            format_kind(&step.kind, messages),
             step.target,
             step.reason
         );
-        print_blockers(&step.blocked_by);
-        print_step_command(step.command.as_deref(), step.manual);
+        print_blockers(&step.blocked_by, messages);
+        print_step_command(step.command.as_deref(), step.manual, messages);
         if step.requires_sudo {
-            println!("  requires sudo: yes");
+            println!("  {}", messages.text(Text::RequiresSudoYes));
         }
     }
 
     Ok(())
 }
 
-pub fn print_install_execution(execution: &InstallExecution, json: bool) -> Result<()> {
+pub fn print_install_execution(
+    execution: &InstallExecution,
+    json: bool,
+    messages: &Messages,
+) -> Result<()> {
     if json {
         println!("{}", serde_json::to_string_pretty(execution)?);
         return Ok(());
     }
 
-    println!("Install execution:");
-    println!("target tool: {}", execution.tool);
+    println!("{}:", messages.text(Text::InstallExecution));
+    println!("{}: {}", messages.text(Text::TargetTool), execution.tool);
     for step in &execution.steps {
         println!(
             "- {} {}: {}",
-            format_execution_status(&step.status),
+            format_execution_status(&step.status, messages),
             step.target,
             step.detail
         );
-        print_blockers(&step.blocked_by);
-        print_step_command(step.command.as_deref(), step.manual);
+        print_blockers(&step.blocked_by, messages);
+        print_step_command(step.command.as_deref(), step.manual, messages);
     }
-    print_install_status(&execution.status);
+    print_install_status(&execution.status, messages);
     let applied = execution
         .steps
         .iter()
         .any(|step| matches!(step.status, crate::sync::SyncStepExecutionStatus::Applied));
     if execution.succeeded && applied {
-        println!("result: install command completed");
+        println!(
+            "{}: {}",
+            messages.text(Text::Result),
+            messages.text(Text::ResultInstallCompleted)
+        );
     } else if execution.succeeded {
-        println!("result: no install command needed");
+        println!(
+            "{}: {}",
+            messages.text(Text::Result),
+            messages.text(Text::ResultInstallNotNeeded)
+        );
     } else {
-        println!("result: install command failed");
+        println!(
+            "{}: {}",
+            messages.text(Text::Result),
+            messages.text(Text::ResultInstallFailed)
+        );
     }
 
     Ok(())
 }
 
-pub fn print_sync_plan(plan: &SyncPlan, json: bool) -> Result<()> {
+pub fn print_sync_plan(plan: &SyncPlan, json: bool, messages: &Messages) -> Result<()> {
     if json {
         println!("{}", serde_json::to_string_pretty(plan)?);
         return Ok(());
     }
 
-    println!("Sync plan{}:", if plan.dry_run { " (dry-run)" } else { "" });
+    println!(
+        "{}{}:",
+        messages.text(Text::SyncPlan),
+        messages.dry_run_suffix(plan.dry_run)
+    );
     if let Some(channel) = &plan.policy_channel {
-        println!("target channel: {channel}");
+        println!("{}: {channel}", messages.text(Text::TargetChannel));
     }
     if let Some(platform) = &plan.platform {
-        println!("target platform: {platform}");
+        println!("{}: {platform}", messages.text(Text::TargetPlatform));
     }
     if plan.auto_fix {
-        println!("policy auto-fix: enabled");
+        println!("{}", messages.text(Text::PolicyAutoFixEnabled));
     }
 
     let ready_steps = plan
@@ -293,17 +346,17 @@ pub fn print_sync_plan(plan: &SyncPlan, json: bool) -> Result<()> {
         .filter_map(|id| plan.steps.iter().find(|step| step.id == *id))
         .collect::<Vec<_>>();
     if !ready_steps.is_empty() {
-        println!("ready:");
+        println!("{}:", messages.text(Text::Ready));
         for step in ready_steps {
-            print_sync_plan_step(step);
+            print_sync_plan_step(step, messages);
         }
     }
 
     if !plan.graph.blocked.is_empty() {
-        println!("blocked:");
+        println!("{}:", messages.text(Text::Blocked));
         for blocked in &plan.graph.blocked {
             if let Some(step) = plan.steps.iter().find(|step| step.id == blocked.id) {
-                print_sync_plan_step(step);
+                print_sync_plan_step(step, messages);
             }
         }
     }
@@ -314,153 +367,184 @@ pub fn print_sync_plan(plan: &SyncPlan, json: bool) -> Result<()> {
         .filter(|step| matches!(step.kind, crate::sync::SyncStepKind::Verify))
         .collect::<Vec<_>>();
     if !verify_steps.is_empty() {
-        println!("verify:");
+        println!("{}:", messages.text(Text::Verify));
         for step in verify_steps {
-            print_sync_plan_step(step);
+            print_sync_plan_step(step, messages);
         }
     }
 
     Ok(())
 }
 
-pub fn print_sync_execution(execution: &SyncExecution, json: bool) -> Result<()> {
+pub fn print_sync_execution(
+    execution: &SyncExecution,
+    json: bool,
+    messages: &Messages,
+) -> Result<()> {
     if json {
         println!("{}", serde_json::to_string_pretty(execution)?);
         return Ok(());
     }
 
-    println!("Sync execution:");
+    println!("{}:", messages.text(Text::SyncExecution));
     if let Some(channel) = &execution.policy_channel {
-        println!("target channel: {channel}");
+        println!("{}: {channel}", messages.text(Text::TargetChannel));
     }
     if let Some(platform) = &execution.platform {
-        println!("target platform: {platform}");
+        println!("{}: {platform}", messages.text(Text::TargetPlatform));
     }
     if execution.auto_fix {
-        println!("policy auto-fix: enabled");
+        println!("{}", messages.text(Text::PolicyAutoFixEnabled));
     }
     for step in &execution.steps {
         println!(
             "- {} {}: {}",
-            format_execution_status(&step.status),
+            format_execution_status(&step.status, messages),
             step.target,
             step.detail
         );
-        print_blockers(&step.blocked_by);
-        print_step_command(step.command.as_deref(), step.manual);
+        print_blockers(&step.blocked_by, messages);
+        print_step_command(step.command.as_deref(), step.manual, messages);
         if let Some(file) = &step.file {
-            println!("  file: {}", file.display());
+            println!("  {}: {}", messages.text(Text::File), file.display());
         }
     }
     if execution.succeeded {
-        println!("result: environment matches policy");
+        println!(
+            "{}: {}",
+            messages.text(Text::Result),
+            messages.text(Text::ResultEnvironmentMatchesPolicy)
+        );
     } else {
-        println!("result: sync stopped before reaching the configured policy");
+        println!(
+            "{}: {}",
+            messages.text(Text::Result),
+            messages.text(Text::ResultSyncStopped)
+        );
     }
 
     Ok(())
 }
 
-fn print_install_status(status: &InstallStatus) {
+fn print_install_status(status: &InstallStatus, messages: &Messages) {
     match status {
         InstallStatus::KnownTool(tool) => {
             println!(
-                "detected: {} {} ({})",
+                "{}: {} {} ({})",
+                messages.text(Text::Detected),
                 tool.name,
                 tool.current.as_deref().unwrap_or("-"),
-                format_status(&tool.status)
+                format_status(&tool.status, messages)
             );
             if let Some(path) = &tool.path {
-                println!("path: {}", path.display());
+                println!("{}: {}", messages.text(Text::Path), path.display());
             }
         }
         InstallStatus::CommandVisible { command, path } => {
-            println!("detected: {command}");
-            println!("path: {}", path.display());
+            println!("{}: {command}", messages.text(Text::Detected));
+            println!("{}: {}", messages.text(Text::Path), path.display());
         }
         InstallStatus::CommandNotVisible { command } => {
-            println!("detected: {command} is not visible in PATH yet");
+            println!(
+                "{}: {command} {}",
+                messages.text(Text::Detected),
+                messages.text(Text::DetectedNotVisibleInPath)
+            );
         }
     }
 }
 
-fn print_step_command(command: Option<&str>, manual: bool) {
+fn print_step_command(command: Option<&str>, manual: bool, messages: &Messages) {
     if let Some(command) = command {
         if manual {
-            println!("  instruction: {command}");
+            println!("  {}: {command}", messages.text(Text::Instruction));
         } else {
-            println!("  command: {command}");
+            println!("  {}: {command}", messages.text(Text::Command));
         }
     }
 }
 
-fn print_sync_plan_step(step: &crate::sync::SyncStep) {
+fn print_sync_plan_step(step: &crate::sync::SyncStep, messages: &Messages) {
     println!(
         "- {} {}: {}",
-        format_kind(&step.kind),
+        format_kind(&step.kind, messages),
         step.target,
         step.reason
     );
-    print_blockers(&step.blocked_by);
-    print_step_command(step.command.as_deref(), step.manual);
+    print_blockers(&step.blocked_by, messages);
+    print_step_command(step.command.as_deref(), step.manual, messages);
     if let Some(file) = &step.file {
-        println!("  file: {}", file.display());
+        println!("  {}: {}", messages.text(Text::File), file.display());
     }
     if let Some(snippet) = &step.snippet {
-        println!("  snippet: {}", snippet.replace('\n', "\n           "));
+        println!(
+            "  {}: {}",
+            messages.text(Text::Snippet),
+            snippet.replace('\n', "\n           ")
+        );
     }
     if step.requires_sudo {
-        println!("  requires sudo: yes");
+        println!("  {}", messages.text(Text::RequiresSudoYes));
     }
 }
 
-fn print_blockers(blocked_by: &[String]) {
+fn print_blockers(blocked_by: &[String], messages: &Messages) {
     if !blocked_by.is_empty() {
-        println!("  blocked by: {}", blocked_by.join(", "));
+        println!(
+            "  {}: {}",
+            messages.text(Text::BlockedBy),
+            blocked_by.join(", ")
+        );
     }
 }
 
-fn format_status(status: &Status) -> &'static str {
+fn format_status(status: &Status, messages: &Messages) -> &'static str {
     match status {
-        Status::Ok => "ok",
-        Status::Missing => "missing",
-        Status::Mismatch => "mismatch",
-        Status::Unknown => "unknown",
+        Status::Ok => messages.label(Label::Ok),
+        Status::Missing => messages.label(Label::Missing),
+        Status::Mismatch => messages.label(Label::Mismatch),
+        Status::Unknown => messages.label(Label::Unknown),
     }
 }
 
-fn format_config_validation_level(level: ConfigValidationLevel) -> &'static str {
+fn format_config_validation_level(
+    level: ConfigValidationLevel,
+    messages: &Messages,
+) -> &'static str {
     match level {
-        ConfigValidationLevel::Error => "error",
-        ConfigValidationLevel::Warning => "warning",
+        ConfigValidationLevel::Error => messages.label(Label::Error),
+        ConfigValidationLevel::Warning => messages.label(Label::Warning),
     }
 }
 
-fn format_issue_severity(severity: IssueSeverity) -> &'static str {
+fn format_issue_severity(severity: IssueSeverity, messages: &Messages) -> &'static str {
     match severity {
-        IssueSeverity::Error => "error",
-        IssueSeverity::Warning => "warning",
-        IssueSeverity::Info => "info",
+        IssueSeverity::Error => messages.label(Label::Error),
+        IssueSeverity::Warning => messages.label(Label::Warning),
+        IssueSeverity::Info => messages.label(Label::Info),
     }
 }
 
-fn format_kind(kind: &crate::sync::SyncStepKind) -> &'static str {
+fn format_kind(kind: &crate::sync::SyncStepKind, messages: &Messages) -> &'static str {
     match kind {
-        crate::sync::SyncStepKind::Install => "install",
-        crate::sync::SyncStepKind::Align => "align",
-        crate::sync::SyncStepKind::Configure => "configure",
-        crate::sync::SyncStepKind::Cleanup => "cleanup",
-        crate::sync::SyncStepKind::Verify => "verify",
-        crate::sync::SyncStepKind::Info => "info",
+        crate::sync::SyncStepKind::Install => messages.label(Label::Install),
+        crate::sync::SyncStepKind::Align => messages.label(Label::Align),
+        crate::sync::SyncStepKind::Configure => messages.label(Label::Configure),
+        crate::sync::SyncStepKind::Cleanup => messages.label(Label::Cleanup),
+        crate::sync::SyncStepKind::Verify => messages.label(Label::Verify),
+        crate::sync::SyncStepKind::Info => messages.label(Label::Info),
     }
 }
 
-fn format_execution_status(status: &crate::sync::SyncStepExecutionStatus) -> &'static str {
+fn format_execution_status(
+    status: &crate::sync::SyncStepExecutionStatus,
+    messages: &Messages,
+) -> &'static str {
     match status {
-        crate::sync::SyncStepExecutionStatus::Applied => "applied",
-        crate::sync::SyncStepExecutionStatus::Unchanged => "unchanged",
-        crate::sync::SyncStepExecutionStatus::Skipped => "skipped",
-        crate::sync::SyncStepExecutionStatus::Failed => "failed",
-        crate::sync::SyncStepExecutionStatus::Verified => "verified",
+        crate::sync::SyncStepExecutionStatus::Applied => messages.label(Label::Applied),
+        crate::sync::SyncStepExecutionStatus::Unchanged => messages.label(Label::Unchanged),
+        crate::sync::SyncStepExecutionStatus::Skipped => messages.label(Label::Skipped),
+        crate::sync::SyncStepExecutionStatus::Failed => messages.label(Label::Failed),
+        crate::sync::SyncStepExecutionStatus::Verified => messages.label(Label::Verified),
     }
 }

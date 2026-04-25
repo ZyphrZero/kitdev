@@ -440,9 +440,22 @@ pub fn build_sync_plan(
 }
 
 pub fn execute_sync_plan(plan: &SyncPlan, config: &DevkitConfig) -> SyncExecution {
+    execute_sync_plan_with_progress(plan, config, |_, _, _| {})
+}
+
+pub fn execute_sync_plan_with_progress<F>(
+    plan: &SyncPlan,
+    config: &DevkitConfig,
+    mut on_step: F,
+) -> SyncExecution
+where
+    F: FnMut(&SyncStep, usize, usize),
+{
     let mut results = Vec::new();
     let mut succeeded = true;
     let mut verify_step = None;
+    let total_steps = plan.steps.len();
+    let mut current_step = 0;
     let ready_ids = plan
         .graph
         .ready
@@ -455,6 +468,8 @@ pub fn execute_sync_plan(plan: &SyncPlan, config: &DevkitConfig) -> SyncExecutio
             verify_step = Some(step);
             continue;
         }
+        current_step += 1;
+        on_step(step, current_step, total_steps);
 
         if !ready_ids.contains(step.id.as_str()) {
             succeeded = false;
@@ -557,6 +572,8 @@ pub fn execute_sync_plan(plan: &SyncPlan, config: &DevkitConfig) -> SyncExecutio
     }
 
     if let Some(step) = verify_step {
+        current_step += 1;
+        on_step(step, current_step, total_steps);
         results.push(build_verify_result(step, &doctor, policy_matches));
     }
 

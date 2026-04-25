@@ -2,23 +2,75 @@
 
 `devkit` is a personal and team development toolchain health CLI. It does not try to replace version managers like `mise`, `fnm`, `rustup`, or `uv`; it checks, reports, and plans fixes across them.
 
+Chinese documentation: [README_ZH.md](README_ZH.md)
+
+## Product model
+
+`devkit` is a cross-platform development toolchain policy controller. It manages the intended development environment for a machine or team, not the package-manager commands themselves. Commands are an implementation detail used to reconcile the current platform with the policy.
+
+The core model is:
+
+- `devkit.toml` is the policy: it describes the desired toolchain state.
+- `doctor` is the diagnostic engine: it inspects the local machine, reports drift, and explains evidence such as active paths, managers, versions, and PATH candidates.
+- `sync` is the policy execution planner: it turns policy drift into a dependency-aware ready/blocked plan, and only applies executable steps when requested.
+- `init` and the TUI are policy editors: they help generate and refine one policy file while showing the effective TOML before writing or applying it.
+
+This means users enable capabilities, not raw internal fields. A tool section should answer two questions:
+
+- what capability should exist, such as Node, Go, Rust, Python, or a CLI package set
+- how that capability should be managed on this platform, such as `fnm`, `nvm`, `rustup`, `uv`, Homebrew, Windows Package Manager, or a standalone installer
+
+Node follows a nested workflow model:
+
+- `[tools.node]` enables the Node.js runtime workflow.
+- `tools.node.manager` selects the Node runtime manager, such as `fnm`, `nvm`, or a platform package manager.
+- `tools.node.package_managers` is the source of truth for enabled Node package-manager workflows.
+- `[tools.npm]`, `[tools.pnpm]`, `[tools.yarn]`, and `[tools.bun]` describe how each enabled package manager is checked, installed, or aligned.
+
+For example:
+
+```toml
+[tools.node]
+version = "24.x"
+manager = "fnm"
+package_managers = ["npm", "pnpm", "yarn", "bun"]
+
+[tools.pnpm]
+version = "latest"
+manager = "corepack"
+
+[tools.yarn]
+version = "stable"
+manager = "corepack"
+
+[tools.bun]
+version = "latest"
+manager = "brew"
+```
+
+In the TUI, the `node` switch controls the Node runtime workflow. The `npm`, `pnpm`, `yarn`, and `bun` switches represent Node package-manager workflows and must stay synchronized with `node.package_managers`. Turning one of those package managers off removes it from `node.package_managers` and removes its tool section from the generated policy. Turning one on adds it back and creates the corresponding tool section. Turning Node off disables the package-manager workflows in the draft because they no longer have an owning runtime workflow.
+
+`devkit` should not manage or install a tool just because it is present on the machine. The policy is the source of intent. Unconfigured tools may be reported as environmental context when useful, but `doctor` and `sync` should focus on configured tools and dependencies required by configured tools.
+
 ## MVP commands
 
 ```bash
-cargo run --
-cargo run -- check -j
-cargo run -- check -c examples/devkit.toml
-cargo run -- new -p
-cargo run -- new -i -p
+cargo run -- doctor
+cargo run -- doctor -j
+cargo run -- doctor -c examples/devkit.toml
+cargo run -- init -p
+cargo run -- init -i -p
+cargo run -- tui
+cargo run -- tui -p
 cargo run -- init --output /tmp/devkit.toml
 cargo run -- config validate -c examples/devkit.toml
 cargo run -- config explain -c examples/devkit.toml
-cargo run -- add bun
-cargo run -- add bun -n
+cargo run -- install bun
+cargo run -- install bun -n
 cargo run -- sync -c examples/devkit.toml
 cargo run -- sync --apply -c examples/devkit.toml
-cargo run -- up -n -c examples/devkit.toml
-cargo run -- up -n --offline -c examples/devkit.toml
+cargo run -- upgrade -n -c examples/devkit.toml
+cargo run -- upgrade -n --offline -c examples/devkit.toml
 cargo run -- cleanup --dry-run
 ```
 
@@ -41,30 +93,29 @@ Platform defaults are intentionally conservative:
 
 ## Bootstrap planning
 
-Daily command aliases are intentionally short:
+Daily commands use one canonical path:
 
-- `devkit` or `devkit check`: inspect the local environment
-- `devkit new -i -p`: interactively print a starter config
+- `devkit doctor`: inspect the local environment
+- `devkit tui`: open the visual policy editor
+- `devkit init -i -p`: interactively print a starter config
 - `devkit config validate`: validate the effective single-file policy
 - `devkit config explain`: show which base and platform override values were applied
-- `devkit add bun`: install one tool
+- `devkit install bun`: install one tool
 - `devkit sync`: preview the policy repair plan
 - `devkit sync --apply`: apply the repair plan
-- `devkit up -n`: preview upgrades
+- `devkit upgrade -n`: preview upgrades
 
-The longer names remain available for scripts: `doctor`, `init`, `install`, and `upgrade`.
+`install <tool>` is the path for a single tool. It runs by default and uses `devkit.toml` when present, while `-n` / `--dry-run` prints the exact command first:
 
-`add <tool>` / `install <tool>` is the shortest path for a single tool. It runs by default and uses `devkit.toml` when present, while `-n` / `--dry-run` prints the exact command first:
-
-- `devkit add bun` installs Bun with the configured or platform default manager
-- `devkit add deno` installs Deno with Homebrew on macOS, standalone installers on Linux, or `winget` on Windows
-- `devkit add node -v 24` installs and selects Node through `fnm`
-- `devkit add node -m nvm -v 24` installs and selects Node through `nvm`
-- `devkit add python -m uv -v 3.13` installs a Python runtime through `uv`
-- `devkit add gh -c examples/devkit.toml` installs or checks a CLI package listed in policy
-- `devkit add gh -m brew` installs an explicit Homebrew CLI package when no policy entry exists
-- `devkit add GitHub.cli -m winget` installs an explicit Windows Package Manager package ID
-- `devkit add gh -c team.toml` can infer the `[tools.cli]` manager from the current machine when the policy lists the package but omits `manager`
+- `devkit install bun` installs Bun with the configured or platform default manager
+- `devkit install deno` installs Deno with Homebrew on macOS, standalone installers on Linux, or `winget` on Windows
+- `devkit install node -v 24` installs and selects Node through `fnm`
+- `devkit install node -m nvm -v 24` installs and selects Node through `nvm`
+- `devkit install python -m uv -v 3.13` installs a Python runtime through `uv`
+- `devkit install gh -c examples/devkit.toml` installs or checks a CLI package listed in policy
+- `devkit install gh -m brew` installs an explicit Homebrew CLI package when no policy entry exists
+- `devkit install GitHub.cli -m winget` installs an explicit Windows Package Manager package ID
+- `devkit install gh -c team.toml` can infer the `[tools.cli]` manager from the current machine when the policy lists the package but omits `manager`
 
 `sync` turns the current machine state plus `devkit.toml` policy into a bootstrap or repair plan. `sync --apply` applies install, align, and managed shell-configuration steps, then verifies the result with `doctor`.
 
@@ -77,20 +128,22 @@ The longer names remain available for scripts: `doctor`, `init`, `install`, and 
 - show step blockers such as `tool:fnm`, `tool:npm`, or `tool:winget` before attempting dependent commands
 - include configured Homebrew, npm, winget, and explicit Linux package-manager CLI packages
 - execute managed shell snippets idempotently with `devkit` markers
-- keep cleanup steps manual even during `sync --yes`
+- keep cleanup steps manual even during `sync --apply`
 - end with a `doctor` verification step
 
 ## Config bootstrap
 
 `init` turns the current machine into a starter `devkit.toml`. The default mode is deterministic; `--interactive` opens a visual TUI where you can trim tools, edit details, and review the live TOML before writing:
 
-- `devkit new -p` prints the generated policy
-- `devkit new -i -p` opens the TUI editor, then prints the accepted policy
+- `devkit init -p` prints the generated policy
+- `devkit tui` opens the TUI editor and writes the accepted policy to `devkit.toml`
+- `devkit tui -p` opens the TUI editor, then prints the accepted policy
+- `devkit init -i -p` opens the TUI editor, then prints the accepted policy
 - `devkit init --output ./devkit.toml` writes a starter file
 - `devkit init --force` overwrites an existing file
 - generated policy includes a stable channel, current platform, detected core runtimes, and a small set of installed CLI packages
 
-In the TUI, use the left pane to choose a section, the center pane to edit fields, and the right pane to review the generated TOML. Main keys are `Up`/`Down` or `j`/`k` to move, `Left`/`Right` or `Tab` to switch panes, `Space` to enable or disable a tool, `Enter` or `e` to edit a field, `P` to open the full preview, `PageUp`/`PageDown` to scroll the preview, `S` to save, and `Q` to cancel. `Esc` is ignored as a destructive close shortcut so terminals that emit arrow-key prefixes as `Esc` do not accidentally exit. Editing Node, Go, or Rust version fields opens a version picker backed by remote release lists where available; choose a major selector such as `24.x`, an exact version, or press `C` to type a custom value such as `24`; press `Q` to close the picker. The TUI renders on stderr, so `devkit new -i -p > devkit.toml` still writes only TOML to the file after you save.
+In the TUI, use the left pane to choose a section, the center pane to edit fields, and the right pane to review the generated TOML. Main keys are `Up`/`Down` or `j`/`k` to move, `Left`/`Right` or `Tab` to switch panes, `Space` to enable or disable a tool, `Enter` or `e` to edit a field, `P` to open the full preview, `PageUp`/`PageDown` to scroll the preview, `S` to save, and `Q` to cancel. `Esc` is ignored as a destructive close shortcut so terminals that emit arrow-key prefixes as `Esc` do not accidentally exit. Editing Node, Go, or Rust version fields opens a version picker backed by remote release lists where available; choose a major selector such as `24.x`, an exact version, or press `C` to type a custom value such as `24`; press `Q` to close the picker. The TUI renders on stderr, so `devkit tui -p > devkit.toml` still writes only TOML to the file after you save.
 
 ## Latest-version providers
 

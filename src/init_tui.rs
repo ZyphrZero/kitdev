@@ -1,7 +1,7 @@
 use std::{
     io,
     path::PathBuf,
-    sync::mpsc::{self, Receiver},
+    sync::mpsc::{self, Receiver, Sender},
     thread,
     time::{Duration, Instant},
 };
@@ -23,7 +23,8 @@ use ratatui::{
 
 use crate::{
     config::DevkitConfig,
-    doctor::{DoctorReport, Status, build_doctor_report},
+    doctor::{DoctorReport, IssueEvidence, IssueSeverity, Status, ToolStatus, build_doctor_report},
+    i18n::{Label, Language, Messages, Text},
     init::{
         CliDraft, GoDraft, HomebrewDraft, InitDraft, InitInteractionOutcome, InitWriteResult,
         NodeDraft, NpmDraft, RustDraft, SimpleToolDraft, render_init_document, write_init_document,
@@ -32,7 +33,7 @@ use crate::{
     platform::OperatingSystem,
     sync::{
         SyncExecution, SyncPlan, SyncStepExecutionStatus, SyncStepKind, build_sync_plan,
-        execute_sync_plan,
+        execute_sync_plan_with_progress,
     },
 };
 
@@ -40,6 +41,7 @@ const TOOL_NAMES: &[&str] = &[
     "fnm", "nvm", "node", "npm", "pnpm", "yarn", "bun", "deno", "go", "rust", "uv", "python",
     "poetry", "ruby", "wrangler",
 ];
+const NODE_PACKAGE_MANAGER_TOOLS: &[&str] = &["npm", "pnpm", "yarn", "bun"];
 
 const MENU_LEN: usize = TOOL_NAMES.len() + 5;
 const ENABLED_DOT: &str = "●";
@@ -50,12 +52,14 @@ pub struct InitTuiOptions {
     pub output: PathBuf,
     pub force: bool,
     pub stdout: bool,
+    pub language: Language,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Focus {
     Menu,
     Fields,
+    SidePanel,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -74,7 +78,6 @@ enum ActionTarget {
     RunCheck,
     PreviewSync,
     ApplySync,
-    Finish,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -131,7 +134,26 @@ struct VersionPickerState {
 
 struct ActionTaskState {
     title: String,
-    receiver: Receiver<std::result::Result<ActionOutput, String>>,
+    progress: ActionProgress,
+    receiver: Receiver<ActionTaskMessage>,
+}
+
+#[derive(Debug, Clone)]
+struct ActionProgress {
+    label: String,
+    detail: Option<String>,
+    current: Option<usize>,
+    total: Option<usize>,
+}
+
+enum ActionTaskMessage {
+    Progress(ActionProgress),
+    Finished(std::result::Result<ActionOutput, String>),
+}
+
+#[derive(Clone)]
+struct ActionProgressReporter {
+    sender: Sender<ActionTaskMessage>,
 }
 
 #[derive(Debug, Clone)]
@@ -174,6 +196,86 @@ enum AppExit {
     Continue,
     Handled,
     Cancelled,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum TuiText {
+    ReadyStatus,
+    ActionsEmpty,
+    PreviewEmpty,
+    NoEditableFields,
+    Full,
+    Back,
+    Scroll,
+    Page,
+    Save,
+    Done,
+    Quit,
+    Move,
+    Pane,
+    Run,
+    Toggle,
+    Edit,
+    Language,
+    ChooseAction,
+    StdoutPreview,
+    ActionRunningWait,
+    EscIgnored,
+    ReturnHint,
+    SidePanelHelp,
+    VersionLookupCancelled,
+    CustomVersionPrompt,
+    CloseEditHint,
+    VersionEditCancelled,
+    ReturnedToVersionList,
+    CustomVersionEmpty,
+    CloseVersionPickerHint,
+    ApplyEditHint,
+    EditCancelled,
+    SelectAction,
+    FullPreviewStatus,
+    ReturnedEditor,
+    ActionsFocused,
+    PreviewFocused,
+    ReturnedFields,
+    FullActionOutputStatus,
+    ReturnedActions,
+    ConfirmApply,
+    ConfirmApplyStatus,
+    ApplyConfirmHint,
+    FinishFailed,
+    Starting,
+    Finished,
+    FinishedWithIssues,
+    Failed,
+    Cancelled,
+    RenderingEffectiveConfig,
+    InspectingLocalTools,
+    FormattingDoctorReport,
+    BuildingSyncGraph,
+    FormattingSyncPreview,
+    RenderingToml,
+    WritingOutput,
+    FormattingSyncExecution,
+    LoadingVersions,
+    LoadingVersionsFor,
+    CurrentValue,
+    CustomSelectorNow,
+    CustomVersionSelector,
+    Source,
+    Version,
+    NodePackageManagers,
+    EnterSaveCancel,
+    EnterApplyCancel,
+    EnterApplyList,
+    EnterSelectCustom,
+    ApplyCancel,
+    Working,
+    Step,
+    ShowGeneratedToml,
+    DoctorAgainstPolicy,
+    DryRunPlan,
+    InstallConfigureNow,
 }
 
 pub fn customize_init_draft_tui(
@@ -236,6 +338,187 @@ fn run_tui(
     }
 }
 
+fn tui_text(messages: Messages, text: TuiText) -> &'static str {
+    match messages.language() {
+        Language::En => match text {
+            TuiText::ReadyStatus => "Ready. Edit the policy, then use Actions to check or sync.",
+            TuiText::ActionsEmpty => {
+                "Run actions from this TUI: save the policy, check the machine, preview sync, or apply sync."
+            }
+            TuiText::PreviewEmpty => {
+                "Press Enter, Tab, or P to open the full TOML preview.\n\nPress F to finish, S to save, or Q to cancel."
+            }
+            TuiText::NoEditableFields => "No editable fields for this section.",
+            TuiText::Full => "full",
+            TuiText::Back => "back",
+            TuiText::Scroll => "scroll",
+            TuiText::Page => "page",
+            TuiText::Save => "save",
+            TuiText::Done => "done",
+            TuiText::Quit => "quit",
+            TuiText::Move => "move",
+            TuiText::Pane => "pane",
+            TuiText::Run => "run",
+            TuiText::Toggle => "toggle",
+            TuiText::Edit => "edit",
+            TuiText::Language => "lang",
+            TuiText::ChooseAction => "Choose an action in the center pane.",
+            TuiText::StdoutPreview => "stdout preview",
+            TuiText::ActionRunningWait => "An action is running; wait for it to finish.",
+            TuiText::EscIgnored => "Use Q to quit; Esc is ignored to protect arrow-key prefixes.",
+            TuiText::ReturnHint => "Use Tab/P to return, Q to quit.",
+            TuiText::SidePanelHelp => {
+                "Tab/P focuses Preview or Actions output; Up/Dn scrolls it. L switches language."
+            }
+            TuiText::VersionLookupCancelled => "Version lookup cancelled",
+            TuiText::CustomVersionPrompt => "Enter a custom version selector",
+            TuiText::CloseEditHint => "Use Ctrl+G to close this edit; Esc is ignored.",
+            TuiText::VersionEditCancelled => "Version edit cancelled",
+            TuiText::ReturnedToVersionList => "Returned to version list",
+            TuiText::CustomVersionEmpty => "Custom version cannot be empty",
+            TuiText::CloseVersionPickerHint => "Use Q to close the version picker",
+            TuiText::ApplyEditHint => "Use Enter to apply this edit; Esc is ignored.",
+            TuiText::EditCancelled => "Edit cancelled",
+            TuiText::SelectAction => "Select an action and press Enter.",
+            TuiText::FullPreviewStatus => {
+                "Full preview: arrows scroll, PgUp/PgDn page, Tab/P returns"
+            }
+            TuiText::ReturnedEditor => "Returned to editor. Tab/P opens preview again.",
+            TuiText::ActionsFocused => {
+                "Actions output focused. Up/Dn scrolls, Enter opens full output."
+            }
+            TuiText::PreviewFocused => "Preview focused. Up/Dn scrolls, Enter opens full preview.",
+            TuiText::ReturnedFields => "Returned to fields. Left moves to Sections.",
+            TuiText::FullActionOutputStatus => {
+                "Full action output: arrows scroll, PgUp/PgDn page, Tab/P returns"
+            }
+            TuiText::ReturnedActions => "Returned to actions. Tab/P opens full output again.",
+            TuiText::ConfirmApply => {
+                "This can run install commands and update managed shell snippets."
+            }
+            TuiText::ConfirmApplyStatus => "Confirm apply sync from the popup.",
+            TuiText::ApplyConfirmHint => "Use A to apply or Q to cancel; Esc is ignored.",
+            TuiText::FinishFailed => "Finish failed; fix the output path or use --force.",
+            TuiText::Starting => "Starting",
+            TuiText::Finished => "finished",
+            TuiText::FinishedWithIssues => "finished with issues",
+            TuiText::Failed => "failed",
+            TuiText::Cancelled => "cancelled",
+            TuiText::RenderingEffectiveConfig => "Rendering effective config",
+            TuiText::InspectingLocalTools => "Inspecting local tools",
+            TuiText::FormattingDoctorReport => "Formatting doctor report",
+            TuiText::BuildingSyncGraph => "Building sync dependency graph",
+            TuiText::FormattingSyncPreview => "Formatting sync preview",
+            TuiText::RenderingToml => "Rendering TOML",
+            TuiText::WritingOutput => "Writing output",
+            TuiText::FormattingSyncExecution => "Formatting sync execution",
+            TuiText::LoadingVersions => "Loading versions",
+            TuiText::LoadingVersionsFor => "Loading versions for",
+            TuiText::CurrentValue => "Current value",
+            TuiText::CustomSelectorNow => "Press C to type a custom selector now, or Q to cancel.",
+            TuiText::CustomVersionSelector => "Custom version selector",
+            TuiText::Source => "Source",
+            TuiText::Version => "Version",
+            TuiText::NodePackageManagers => "node package",
+            TuiText::EnterSaveCancel => "Enter save   Ctrl+G cancel   Backspace delete",
+            TuiText::EnterApplyCancel => "Enter apply   Ctrl+G cancel   Backspace delete",
+            TuiText::EnterApplyList => "Enter apply   Ctrl+G list   Backspace delete",
+            TuiText::EnterSelectCustom => {
+                "Enter select   C custom   type a number to enter custom   Q cancel"
+            }
+            TuiText::ApplyCancel => "A apply   Q cancel",
+            TuiText::Working => "Working",
+            TuiText::Step => "Step",
+            TuiText::ShowGeneratedToml => "show generated TOML",
+            TuiText::DoctorAgainstPolicy => "doctor against current policy",
+            TuiText::DryRunPlan => "dry-run plan",
+            TuiText::InstallConfigureNow => "install/configure now",
+        },
+        Language::Zh => match text {
+            TuiText::ReadyStatus => "就绪。编辑策略后，可在操作中检查或同步。",
+            TuiText::ActionsEmpty => "可在此执行保存策略、检查当前机器、预览同步或执行同步。",
+            TuiText::PreviewEmpty => {
+                "按 Enter、Tab 或 P 打开完整 TOML 预览。\n\n按 F 完成，S 保存，Q 退出。"
+            }
+            TuiText::NoEditableFields => "此区域没有可编辑字段。",
+            TuiText::Full => "完整",
+            TuiText::Back => "返回",
+            TuiText::Scroll => "滚动",
+            TuiText::Page => "翻页",
+            TuiText::Save => "保存",
+            TuiText::Done => "完成",
+            TuiText::Quit => "退出",
+            TuiText::Move => "移动",
+            TuiText::Pane => "面板",
+            TuiText::Run => "运行",
+            TuiText::Toggle => "切换",
+            TuiText::Edit => "编辑",
+            TuiText::Language => "语言",
+            TuiText::ChooseAction => "请在中间面板选择一个操作。",
+            TuiText::StdoutPreview => "stdout 预览",
+            TuiText::ActionRunningWait => "操作正在运行，请等待完成。",
+            TuiText::EscIgnored => "按 Q 退出；Esc 会被忽略，以避免误判方向键前缀。",
+            TuiText::ReturnHint => "按 Tab/P 返回，Q 退出。",
+            TuiText::SidePanelHelp => "Tab/P 聚焦预览或操作输出；Up/Dn 滚动。L 切换语言。",
+            TuiText::VersionLookupCancelled => "已取消版本查询",
+            TuiText::CustomVersionPrompt => "请输入自定义版本选择器",
+            TuiText::CloseEditHint => "按 Ctrl+G 关闭编辑；Esc 会被忽略。",
+            TuiText::VersionEditCancelled => "已取消版本编辑",
+            TuiText::ReturnedToVersionList => "已返回版本列表",
+            TuiText::CustomVersionEmpty => "自定义版本不能为空",
+            TuiText::CloseVersionPickerHint => "按 Q 关闭版本选择器",
+            TuiText::ApplyEditHint => "按 Enter 应用编辑；Esc 会被忽略。",
+            TuiText::EditCancelled => "已取消编辑",
+            TuiText::SelectAction => "请选择操作并按 Enter。",
+            TuiText::FullPreviewStatus => "完整预览：方向键滚动，PgUp/PgDn 翻页，Tab/P 返回",
+            TuiText::ReturnedEditor => "已返回编辑器。Tab/P 可再次打开预览。",
+            TuiText::ActionsFocused => "已聚焦操作输出。Up/Dn 滚动，Enter 打开完整输出。",
+            TuiText::PreviewFocused => "已聚焦预览。Up/Dn 滚动，Enter 打开完整预览。",
+            TuiText::ReturnedFields => "已返回字段面板。Left 移动到区域列表。",
+            TuiText::FullActionOutputStatus => {
+                "完整操作输出：方向键滚动，PgUp/PgDn 翻页，Tab/P 返回"
+            }
+            TuiText::ReturnedActions => "已返回操作。Tab/P 可再次打开完整输出。",
+            TuiText::ConfirmApply => "这会运行安装命令，并更新受管理的 shell 配置片段。",
+            TuiText::ConfirmApplyStatus => "请在弹窗中确认执行同步。",
+            TuiText::ApplyConfirmHint => "按 A 执行或 Q 取消；Esc 会被忽略。",
+            TuiText::FinishFailed => "完成失败；请修复输出路径或使用 --force。",
+            TuiText::Starting => "启动中",
+            TuiText::Finished => "已完成",
+            TuiText::FinishedWithIssues => "已完成但存在问题",
+            TuiText::Failed => "失败",
+            TuiText::Cancelled => "已取消",
+            TuiText::RenderingEffectiveConfig => "正在生成有效配置",
+            TuiText::InspectingLocalTools => "正在检查本地工具",
+            TuiText::FormattingDoctorReport => "正在格式化检查报告",
+            TuiText::BuildingSyncGraph => "正在构建同步依赖图",
+            TuiText::FormattingSyncPreview => "正在格式化同步预览",
+            TuiText::RenderingToml => "正在生成 TOML",
+            TuiText::WritingOutput => "正在写入输出",
+            TuiText::FormattingSyncExecution => "正在格式化同步结果",
+            TuiText::LoadingVersions => "正在加载版本",
+            TuiText::LoadingVersionsFor => "正在加载版本：",
+            TuiText::CurrentValue => "当前值",
+            TuiText::CustomSelectorNow => "按 C 立即输入自定义选择器，或按 Q 取消。",
+            TuiText::CustomVersionSelector => "自定义版本选择器",
+            TuiText::Source => "来源",
+            TuiText::Version => "版本",
+            TuiText::NodePackageManagers => "Node 包",
+            TuiText::EnterSaveCancel => "Enter 保存   Ctrl+G 取消   Backspace 删除",
+            TuiText::EnterApplyCancel => "Enter 应用   Ctrl+G 取消   Backspace 删除",
+            TuiText::EnterApplyList => "Enter 应用   Ctrl+G 列表   Backspace 删除",
+            TuiText::EnterSelectCustom => "Enter 选择   C 自定义   输入数字进入自定义   Q 取消",
+            TuiText::ApplyCancel => "A 执行   Q 取消",
+            TuiText::Working => "处理中",
+            TuiText::Step => "步骤",
+            TuiText::ShowGeneratedToml => "显示生成的 TOML",
+            TuiText::DoctorAgainstPolicy => "按当前策略运行 doctor",
+            TuiText::DryRunPlan => "预览计划",
+            TuiText::InstallConfigureNow => "立即安装/配置",
+        },
+    }
+}
+
 impl InitTuiApp {
     #[cfg(test)]
     fn new(draft: InitDraft) -> Self {
@@ -245,11 +528,14 @@ impl InitTuiApp {
                 output: PathBuf::from("devkit.toml"),
                 force: false,
                 stdout: false,
+                language: Language::En,
             },
         )
     }
 
-    fn with_options(draft: InitDraft, options: InitTuiOptions) -> Self {
+    fn with_options(mut draft: InitDraft, options: InitTuiOptions) -> Self {
+        normalize_node_package_manager_state(&mut draft);
+        let messages = Messages::new(options.language);
         Self {
             draft,
             options,
@@ -263,13 +549,17 @@ impl InitTuiApp {
             action_output: None,
             action_scroll: 0,
             confirm: None,
-            status: "Ready. Edit the policy, then use Actions to check or sync.".to_string(),
+            status: tui_text(messages, TuiText::ReadyStatus).to_string(),
             preview_scroll: 0,
             preview_expanded: false,
             action_expanded: false,
             saved_once: false,
             dirty: true,
         }
+    }
+
+    fn messages(&self) -> Messages {
+        Messages::new(self.options.language)
     }
 
     fn render(&mut self, frame: &mut Frame) {
@@ -287,34 +577,36 @@ impl InitTuiApp {
         self.render_body(frame, root[1]);
         self.render_footer(frame, root[2]);
 
+        let messages = self.messages();
         if let Some(edit) = &self.edit {
-            render_edit_popup(frame, area, edit);
+            render_edit_popup(frame, area, edit, messages);
         }
         if let Some(fetch) = &self.version_fetch {
-            render_version_loading_popup(frame, area, fetch);
+            render_version_loading_popup(frame, area, fetch, messages);
         }
         if let Some(picker) = &self.version_picker {
-            render_version_picker(frame, area, picker);
+            render_version_picker(frame, area, picker, messages);
         }
         if let Some(confirm) = &self.confirm {
-            render_confirm_popup(frame, area, confirm);
+            render_confirm_popup(frame, area, confirm, messages);
         }
         if let Some(task) = &self.action_task {
-            render_action_loading_popup(frame, area, task);
+            render_action_loading_popup(frame, area, task, messages);
         }
     }
 
     fn render_header(&self, frame: &mut Frame, area: Rect) {
+        let messages = self.messages();
         let enabled = TOOL_NAMES
             .iter()
             .filter(|tool| tool_enabled(&self.draft, tool))
             .count();
         let state = if self.action_task.is_some() {
-            ("running", Color::Yellow)
+            (messages.text(Text::Running), Color::Yellow)
         } else if self.dirty {
-            ("unsaved", Color::Yellow)
+            (messages.text(Text::Unsaved), Color::Yellow)
         } else {
-            ("saved", Color::Green)
+            (messages.text(Text::Saved), Color::Green)
         };
         let output = if self.options.stdout {
             "stdout".to_string()
@@ -329,25 +621,29 @@ impl InitTuiApp {
                         .fg(Color::Cyan)
                         .add_modifier(Modifier::BOLD),
                 ),
-                Span::raw("  policy builder  "),
+                Span::raw(format!("  {}  ", messages.text(Text::PolicyBuilder))),
                 Span::styled(
                     format!("[{}]", state.0),
                     Style::default().fg(state.1).add_modifier(Modifier::BOLD),
                 ),
             ]),
             Line::from(vec![
-                Span::raw("channel "),
+                Span::raw(format!("{} ", messages.text(Text::Channel))),
                 Span::styled(
                     &self.draft.policy.channel,
                     Style::default().fg(Color::Green),
                 ),
-                Span::raw("  platform "),
+                Span::raw(format!("  {} ", messages.text(Text::Platform))),
                 Span::styled(
                     &self.draft.policy.platform,
                     Style::default().fg(Color::Green),
                 ),
-                Span::raw(format!("  enabled tools {enabled}/{}", TOOL_NAMES.len())),
-                Span::raw("  output "),
+                Span::raw(format!(
+                    "  {} {enabled}/{}",
+                    messages.text(Text::EnabledTools),
+                    TOOL_NAMES.len()
+                )),
+                Span::raw(format!("  {} ", messages.text(Text::Output))),
                 Span::styled(output, Style::default().fg(Color::Magenta)),
             ]),
         ];
@@ -404,9 +700,10 @@ impl InitTuiApp {
     }
 
     fn render_menu(&self, frame: &mut Frame, area: Rect) {
+        let messages = self.messages();
         let items = menu_entries()
             .into_iter()
-            .map(|entry| ListItem::new(menu_line(&self.draft, entry)))
+            .map(|entry| ListItem::new(menu_line(&self.draft, entry, messages)))
             .collect::<Vec<_>>();
         let mut state = ListState::default();
         state.select(Some(self.menu_index));
@@ -418,7 +715,7 @@ impl InitTuiApp {
         let list = List::new(items)
             .block(
                 Block::default()
-                    .title(" Sections ")
+                    .title(format!(" {} ", messages.text(Text::Sections)))
                     .borders(Borders::ALL)
                     .border_style(Style::default().fg(border))
                     .padding(Padding::horizontal(1)),
@@ -434,6 +731,7 @@ impl InitTuiApp {
     }
 
     fn render_fields(&mut self, frame: &mut Frame, area: Rect) {
+        let messages = self.messages();
         let entry = current_menu_entry(self.menu_index);
         let fields = field_rows(&self.draft, entry, &self.options);
         if self.field_index >= fields.len() {
@@ -447,20 +745,16 @@ impl InitTuiApp {
             Color::DarkGray
         };
         let block = Block::default()
-            .title(format!(" {} ", entry_title(entry)))
+            .title(format!(" {} ", entry_title(entry, messages)))
             .borders(Borders::ALL)
             .border_style(Style::default().fg(border))
             .padding(Padding::horizontal(1));
 
         if fields.is_empty() {
             let text = match entry {
-                MenuEntry::Actions => {
-                    "Run actions from this TUI: save the policy, check the machine, preview sync, apply sync, or finish."
-                }
-                MenuEntry::Preview => {
-                    "Press Enter or P to open the full TOML preview.\n\nPress S to accept this policy or Q to cancel."
-                }
-                _ => "No editable fields for this section.",
+                MenuEntry::Actions => tui_text(messages, TuiText::ActionsEmpty),
+                MenuEntry::Preview => tui_text(messages, TuiText::PreviewEmpty),
+                _ => tui_text(messages, TuiText::NoEditableFields),
             };
             frame.render_widget(
                 Paragraph::new(text).block(block).wrap(Wrap { trim: true }),
@@ -507,18 +801,33 @@ impl InitTuiApp {
     }
 
     fn render_preview(&self, frame: &mut Frame, area: Rect, expanded: bool) {
+        let messages = self.messages();
         let preview = render_init_document(&self.draft).content;
         let title = if expanded {
-            " Preview - full (P/Tab back, PgUp/PgDn scroll) "
+            format!(
+                " {} - {} (Tab/P {}, PgUp/PgDn {}) ",
+                messages.text(Text::Preview),
+                tui_text(messages, TuiText::Full),
+                tui_text(messages, TuiText::Back),
+                tui_text(messages, TuiText::Scroll)
+            )
         } else {
-            " Preview "
+            format!(" {} ", messages.text(Text::Preview))
+        };
+        let border = if expanded
+            || (self.focus == Focus::SidePanel
+                && !matches!(current_menu_entry(self.menu_index), MenuEntry::Actions))
+        {
+            Color::Magenta
+        } else {
+            Color::DarkGray
         };
         let paragraph = Paragraph::new(preview)
             .block(
                 Block::default()
                     .title(title)
                     .borders(Borders::ALL)
-                    .border_style(Style::default().fg(Color::DarkGray)),
+                    .border_style(Style::default().fg(border)),
             )
             .scroll((self.preview_scroll, 0))
             .wrap(Wrap { trim: false });
@@ -526,8 +835,9 @@ impl InitTuiApp {
     }
 
     fn render_action_output(&self, frame: &mut Frame, area: Rect, expanded: bool) {
+        let messages = self.messages();
         let output_label = if self.options.stdout {
-            "stdout preview".to_string()
+            tui_text(messages, TuiText::StdoutPreview).to_string()
         } else {
             self.options.output.to_string_lossy().to_string()
         };
@@ -535,30 +845,47 @@ impl InitTuiApp {
             Some(output) => {
                 let title = if expanded {
                     format!(
-                        " Actions - full - {} (P/Tab back, PgUp/PgDn scroll) ",
-                        output.title
+                        " {} - {} - {} (Tab/P {}, PgUp/PgDn {}) ",
+                        messages.text(Text::Actions),
+                        tui_text(messages, TuiText::Full),
+                        output.title,
+                        tui_text(messages, TuiText::Back),
+                        tui_text(messages, TuiText::Scroll)
                     )
                 } else {
-                    format!(" Actions - {} ", output.title)
+                    format!(" {} - {} ", messages.text(Text::Actions), output.title)
                 };
                 (title, output.lines.clone(), output.ok)
             }
             None => (
                 if expanded {
-                    " Actions - full (P/Tab back) ".to_string()
+                    format!(
+                        " {} - {} (Tab/P {}) ",
+                        messages.text(Text::Actions),
+                        tui_text(messages, TuiText::Full),
+                        tui_text(messages, TuiText::Back)
+                    )
                 } else {
-                    " Actions ".to_string()
+                    format!(" {} ", messages.text(Text::Actions))
                 },
                 vec![
-                    format!("Output: {output_label}"),
+                    format!("{}: {output_label}", messages.text(Text::Output)),
                     String::new(),
-                    "Choose an action in the center pane.".to_string(),
+                    tui_text(messages, TuiText::ChooseAction).to_string(),
                 ],
                 true,
             ),
         };
-        let border = if ok { Color::DarkGray } else { Color::Red };
-        let paragraph = Paragraph::new(lines.join("\n"))
+        let border = if !ok {
+            Color::Red
+        } else if self.focus == Focus::SidePanel
+            && matches!(current_menu_entry(self.menu_index), MenuEntry::Actions)
+        {
+            Color::Green
+        } else {
+            Color::DarkGray
+        };
+        let paragraph = Paragraph::new(action_output_lines(&lines))
             .block(
                 Block::default()
                     .title(title)
@@ -571,56 +898,87 @@ impl InitTuiApp {
     }
 
     fn render_footer(&self, frame: &mut Frame, area: Rect) {
+        let messages = self.messages();
         let keys = if self.preview_expanded || self.action_expanded {
             Line::from(vec![
                 Span::styled("Up/Dn", Style::default().fg(Color::Cyan)),
-                Span::raw(" scroll  "),
+                Span::raw(format!(" {}  ", tui_text(messages, TuiText::Scroll))),
                 Span::styled("PgUp/PgDn", Style::default().fg(Color::Cyan)),
-                Span::raw(" page  "),
-                Span::styled("P/Tab", Style::default().fg(Color::Cyan)),
-                Span::raw(" back  "),
+                Span::raw(format!(" {}  ", tui_text(messages, TuiText::Page))),
+                Span::styled("Tab/P", Style::default().fg(Color::Cyan)),
+                Span::raw(format!(" {}  ", tui_text(messages, TuiText::Back))),
                 Span::styled("S", Style::default().fg(Color::Green)),
-                Span::raw(" save  "),
+                Span::raw(format!(" {}  ", tui_text(messages, TuiText::Save))),
                 Span::styled("F", Style::default().fg(Color::Green)),
-                Span::raw(" done  "),
+                Span::raw(format!(" {}  ", tui_text(messages, TuiText::Done))),
+                Span::styled("L", Style::default().fg(Color::Magenta)),
+                Span::raw(format!(" {}  ", tui_text(messages, TuiText::Language))),
                 Span::styled("Q", Style::default().fg(Color::Red)),
-                Span::raw(" quit"),
+                Span::raw(format!(" {}", tui_text(messages, TuiText::Quit))),
+            ])
+        } else if self.focus == Focus::SidePanel {
+            let target = if matches!(current_menu_entry(self.menu_index), MenuEntry::Actions) {
+                messages.text(Text::Output)
+            } else {
+                messages.text(Text::Preview)
+            };
+            Line::from(vec![
+                Span::styled("Up/Dn", Style::default().fg(Color::Cyan)),
+                Span::raw(format!(" {}  ", tui_text(messages, TuiText::Scroll))),
+                Span::styled("PgUp/PgDn", Style::default().fg(Color::Cyan)),
+                Span::raw(format!(" {}  ", tui_text(messages, TuiText::Page))),
+                Span::styled("Tab/P", Style::default().fg(Color::Magenta)),
+                Span::raw(format!(" {}  ", tui_text(messages, TuiText::Back))),
+                Span::styled("Enter", Style::default().fg(Color::Cyan)),
+                Span::raw(format!(" {} ", tui_text(messages, TuiText::Full))),
+                Span::raw(target),
+                Span::raw("  "),
+                Span::styled("←/→", Style::default().fg(Color::Cyan)),
+                Span::raw(format!(" {}  ", tui_text(messages, TuiText::Pane))),
+                Span::styled("L", Style::default().fg(Color::Magenta)),
+                Span::raw(format!(" {}  ", tui_text(messages, TuiText::Language))),
+                Span::styled("Q", Style::default().fg(Color::Red)),
+                Span::raw(format!(" {}", tui_text(messages, TuiText::Quit))),
             ])
         } else if matches!(current_menu_entry(self.menu_index), MenuEntry::Actions) {
             Line::from(vec![
                 Span::styled("Up/Dn", Style::default().fg(Color::Cyan)),
-                Span::raw(" move  "),
-                Span::styled("L/R", Style::default().fg(Color::Cyan)),
-                Span::raw(" pane  "),
+                Span::raw(format!(" {}  ", tui_text(messages, TuiText::Move))),
+                Span::styled("←/→", Style::default().fg(Color::Cyan)),
+                Span::raw(format!(" {}  ", tui_text(messages, TuiText::Pane))),
                 Span::styled("Enter", Style::default().fg(Color::Cyan)),
-                Span::raw(" run  "),
-                Span::styled("P", Style::default().fg(Color::Magenta)),
-                Span::raw(" full output  "),
+                Span::raw(format!(" {}  ", tui_text(messages, TuiText::Run))),
+                Span::styled("Tab/P", Style::default().fg(Color::Magenta)),
+                Span::raw(format!(" {}  ", messages.text(Text::Output))),
                 Span::styled("S", Style::default().fg(Color::Green)),
-                Span::raw(" save  "),
+                Span::raw(format!(" {}  ", tui_text(messages, TuiText::Save))),
                 Span::styled("F", Style::default().fg(Color::Green)),
-                Span::raw(" done  "),
+                Span::raw(format!(" {}  ", tui_text(messages, TuiText::Done))),
+                Span::styled("L", Style::default().fg(Color::Magenta)),
+                Span::raw(format!(" {}  ", tui_text(messages, TuiText::Language))),
                 Span::styled("Q", Style::default().fg(Color::Red)),
-                Span::raw(" quit"),
+                Span::raw(format!(" {}", tui_text(messages, TuiText::Quit))),
             ])
         } else {
             Line::from(vec![
                 Span::styled("Up/Dn", Style::default().fg(Color::Cyan)),
-                Span::raw(" move  "),
-                Span::styled("L/R", Style::default().fg(Color::Cyan)),
-                Span::raw(" pane  "),
+                Span::raw(format!(" {}  ", tui_text(messages, TuiText::Move))),
+                Span::styled("←/→", Style::default().fg(Color::Cyan)),
+                Span::raw(format!(" {}  ", tui_text(messages, TuiText::Pane))),
                 Span::styled("Space", Style::default().fg(Color::Cyan)),
-                Span::raw(" toggle  "),
+                Span::raw(format!(" {}  ", tui_text(messages, TuiText::Toggle))),
                 Span::styled("Enter", Style::default().fg(Color::Cyan)),
-                Span::raw(" edit  "),
-                Span::styled("P", Style::default().fg(Color::Magenta)),
-                Span::raw(" view  "),
+                Span::raw(format!(" {}  ", tui_text(messages, TuiText::Edit))),
+                Span::styled("Tab/P", Style::default().fg(Color::Magenta)),
+                Span::raw(format!(" {}  ", messages.text(Text::Preview))),
                 Span::styled("S", Style::default().fg(Color::Green)),
-                Span::raw(" save  "),
+                Span::raw(format!(" {}  ", tui_text(messages, TuiText::Save))),
                 Span::styled("F", Style::default().fg(Color::Green)),
-                Span::raw(" done  "),
+                Span::raw(format!(" {}  ", tui_text(messages, TuiText::Done))),
+                Span::styled("L", Style::default().fg(Color::Magenta)),
+                Span::raw(format!(" {}  ", tui_text(messages, TuiText::Language))),
                 Span::styled("Q", Style::default().fg(Color::Red)),
-                Span::raw(" quit"),
+                Span::raw(format!(" {}", tui_text(messages, TuiText::Quit))),
             ])
         };
         let paragraph = Paragraph::new(vec![keys, Line::from(self.status.as_str())]).block(
@@ -632,9 +990,10 @@ impl InitTuiApp {
     }
 
     fn handle_key(&mut self, key: KeyEvent) -> Option<AppExit> {
+        let messages = self.messages();
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
             if self.action_task.is_some() {
-                self.status = "An action is running; wait for it to finish.".to_string();
+                self.status = tui_text(messages, TuiText::ActionRunningWait).to_string();
                 return None;
             }
             return Some(AppExit::Cancelled);
@@ -645,7 +1004,7 @@ impl InitTuiApp {
         }
 
         if self.action_task.is_some() {
-            self.status = "An action is running; wait for it to finish.".to_string();
+            self.status = tui_text(messages, TuiText::ActionRunningWait).to_string();
             return None;
         }
 
@@ -669,8 +1028,7 @@ impl InitTuiApp {
         match key.code {
             KeyCode::Char('q') | KeyCode::Char('Q') => Some(AppExit::Cancelled),
             KeyCode::Esc => {
-                self.status =
-                    "Use Q to quit; Esc is ignored to protect arrow-key prefixes.".to_string();
+                self.status = tui_text(messages, TuiText::EscIgnored).to_string();
                 None
             }
             KeyCode::Char('s') | KeyCode::Char('S') => {
@@ -678,24 +1036,42 @@ impl InitTuiApp {
                 None
             }
             KeyCode::Char('f') | KeyCode::Char('F') => self.finish(),
+            KeyCode::Char('l') | KeyCode::Char('L') => {
+                self.toggle_language();
+                None
+            }
             KeyCode::Tab => {
-                self.toggle_focus();
+                self.toggle_side_panel_focus();
                 None
             }
             KeyCode::Right => {
-                self.focus = Focus::Fields;
+                self.focus = match self.focus {
+                    Focus::Menu => Focus::Fields,
+                    Focus::Fields | Focus::SidePanel => Focus::SidePanel,
+                };
                 None
             }
             KeyCode::Left => {
-                self.focus = Focus::Menu;
+                self.focus = match self.focus {
+                    Focus::SidePanel => Focus::Fields,
+                    Focus::Fields | Focus::Menu => Focus::Menu,
+                };
                 None
             }
             KeyCode::Up | KeyCode::Char('k') => {
-                self.move_selection(-1);
+                if self.focus == Focus::SidePanel {
+                    self.scroll_active_panel(-1);
+                } else {
+                    self.move_selection(-1);
+                }
                 None
             }
             KeyCode::Down | KeyCode::Char('j') => {
-                self.move_selection(1);
+                if self.focus == Focus::SidePanel {
+                    self.scroll_active_panel(1);
+                } else {
+                    self.move_selection(1);
+                }
                 None
             }
             KeyCode::PageUp => {
@@ -708,18 +1084,19 @@ impl InitTuiApp {
             }
             KeyCode::Char(' ') => self.toggle_current_tool_or_field(),
             KeyCode::Enter | KeyCode::Char('e') | KeyCode::Char('E') => {
-                self.start_edit_or_focus_fields()
+                if self.focus == Focus::SidePanel {
+                    self.open_context_panel();
+                    None
+                } else {
+                    self.start_edit_or_focus_fields()
+                }
             }
             KeyCode::Char('p') | KeyCode::Char('P') => {
-                if matches!(current_menu_entry(self.menu_index), MenuEntry::Actions) {
-                    self.open_action_output();
-                } else {
-                    self.open_preview();
-                }
+                self.toggle_side_panel_focus();
                 None
             }
             KeyCode::Char('?') => {
-                self.status = "P opens full preview; PageUp/PageDown scrolls TOML".to_string();
+                self.status = tui_text(messages, TuiText::SidePanelHelp).to_string();
                 None
             }
             _ => None,
@@ -727,10 +1104,11 @@ impl InitTuiApp {
     }
 
     fn handle_preview_key(&mut self, key: KeyEvent) -> Option<AppExit> {
+        let messages = self.messages();
         match key.code {
             KeyCode::Char('q') | KeyCode::Char('Q') => Some(AppExit::Cancelled),
             KeyCode::Esc => {
-                self.status = "Use P or Tab to return, Q to quit.".to_string();
+                self.status = tui_text(messages, TuiText::ReturnHint).to_string();
                 None
             }
             KeyCode::Char('s') | KeyCode::Char('S') => {
@@ -738,6 +1116,10 @@ impl InitTuiApp {
                 None
             }
             KeyCode::Char('f') | KeyCode::Char('F') => self.finish(),
+            KeyCode::Char('l') | KeyCode::Char('L') => {
+                self.toggle_language();
+                None
+            }
             KeyCode::Char('p')
             | KeyCode::Char('P')
             | KeyCode::Tab
@@ -775,10 +1157,11 @@ impl InitTuiApp {
     }
 
     fn handle_action_output_key(&mut self, key: KeyEvent) -> Option<AppExit> {
+        let messages = self.messages();
         match key.code {
             KeyCode::Char('q') | KeyCode::Char('Q') => Some(AppExit::Cancelled),
             KeyCode::Esc => {
-                self.status = "Use P or Tab to return, Q to quit.".to_string();
+                self.status = tui_text(messages, TuiText::ReturnHint).to_string();
                 None
             }
             KeyCode::Char('s') | KeyCode::Char('S') => {
@@ -786,6 +1169,10 @@ impl InitTuiApp {
                 None
             }
             KeyCode::Char('f') | KeyCode::Char('F') => self.finish(),
+            KeyCode::Char('l') | KeyCode::Char('L') => {
+                self.toggle_language();
+                None
+            }
             KeyCode::Char('p')
             | KeyCode::Char('P')
             | KeyCode::Tab
@@ -823,10 +1210,11 @@ impl InitTuiApp {
     }
 
     fn handle_version_loading_key(&mut self, key: KeyEvent) -> Option<AppExit> {
+        let messages = self.messages();
         match key.code {
             KeyCode::Char('q') | KeyCode::Char('Q') => {
                 self.version_fetch = None;
-                self.status = "Version lookup cancelled".to_string();
+                self.status = tui_text(messages, TuiText::VersionLookupCancelled).to_string();
             }
             KeyCode::Char('c') | KeyCode::Char('C') => {
                 if let Some(fetch) = self.version_fetch.take() {
@@ -835,7 +1223,7 @@ impl InitTuiApp {
                         fetch.label,
                         fetch.current,
                     ));
-                    self.status = "Enter a custom version selector".to_string();
+                    self.status = tui_text(messages, TuiText::CustomVersionPrompt).to_string();
                 }
             }
             _ => {}
@@ -844,29 +1232,31 @@ impl InitTuiApp {
     }
 
     fn handle_version_picker_key(&mut self, key: KeyEvent) -> Option<AppExit> {
+        let messages = self.messages();
         let mut picker = self.version_picker.take().expect("version picker checked");
 
         if picker.custom_mode {
             match key.code {
                 KeyCode::Esc => {
-                    self.status = "Use Ctrl+G to close this edit; Esc is ignored.".to_string();
+                    self.status = tui_text(messages, TuiText::CloseEditHint).to_string();
                     self.version_picker = Some(picker);
                 }
                 KeyCode::Char('g') | KeyCode::Char('G')
                     if key.modifiers.contains(KeyModifiers::CONTROL) =>
                 {
                     if picker.choices.is_empty() {
-                        self.status = "Version edit cancelled".to_string();
+                        self.status = tui_text(messages, TuiText::VersionEditCancelled).to_string();
                     } else {
                         picker.custom_mode = false;
-                        self.status = "Returned to version list".to_string();
+                        self.status =
+                            tui_text(messages, TuiText::ReturnedToVersionList).to_string();
                         self.version_picker = Some(picker);
                     }
                 }
                 KeyCode::Enter => {
                     let value = picker.custom_buffer.trim().to_string();
                     if value.is_empty() {
-                        self.status = "Custom version cannot be empty".to_string();
+                        self.status = tui_text(messages, TuiText::CustomVersionEmpty).to_string();
                         self.version_picker = Some(picker);
                     } else {
                         apply_field_edit(&mut self.draft, &picker.target, &value);
@@ -899,10 +1289,10 @@ impl InitTuiApp {
 
         match key.code {
             KeyCode::Char('q') | KeyCode::Char('Q') => {
-                self.status = "Version edit cancelled".to_string();
+                self.status = tui_text(messages, TuiText::VersionEditCancelled).to_string();
             }
             KeyCode::Esc => {
-                self.status = "Use Q to close the version picker".to_string();
+                self.status = tui_text(messages, TuiText::CloseVersionPickerHint).to_string();
                 self.version_picker = Some(picker);
             }
             KeyCode::Enter => {
@@ -946,16 +1336,17 @@ impl InitTuiApp {
     }
 
     fn handle_edit_key(&mut self, key: KeyEvent) -> Option<AppExit> {
+        let messages = self.messages();
         let mut edit = self.edit.take().expect("edit mode checked");
         match key.code {
             KeyCode::Esc => {
-                self.status = "Use Enter to apply this edit; Esc is ignored.".to_string();
+                self.status = tui_text(messages, TuiText::ApplyEditHint).to_string();
                 self.edit = Some(edit);
             }
             KeyCode::Char('g') | KeyCode::Char('G')
                 if key.modifiers.contains(KeyModifiers::CONTROL) =>
             {
-                self.status = "Edit cancelled".to_string();
+                self.status = tui_text(messages, TuiText::EditCancelled).to_string();
             }
             KeyCode::Enter => {
                 apply_field_edit(&mut self.draft, &edit.target, edit.buffer.trim());
@@ -985,13 +1376,6 @@ impl InitTuiApp {
         None
     }
 
-    fn toggle_focus(&mut self) {
-        self.focus = match self.focus {
-            Focus::Menu => Focus::Fields,
-            Focus::Fields => Focus::Menu,
-        };
-    }
-
     fn move_selection(&mut self, delta: isize) {
         match self.focus {
             Focus::Menu => {
@@ -1008,17 +1392,23 @@ impl InitTuiApp {
                     self.field_index = move_index(self.field_index, fields.len(), delta);
                 }
             }
+            Focus::SidePanel => {
+                self.scroll_active_panel(delta.clamp(i16::MIN as isize, i16::MAX as isize) as i16);
+            }
         }
     }
 
     fn toggle_current_tool_or_field(&mut self) -> Option<AppExit> {
+        let messages = self.messages();
         match self.focus {
             Focus::Menu => {
                 if let MenuEntry::Tool(tool) = current_menu_entry(self.menu_index) {
                     toggle_tool(&mut self.draft, tool);
                     self.mark_dirty();
-                    self.status =
-                        format!("{tool} {}", enabled_label(tool_enabled(&self.draft, tool)));
+                    self.status = format!(
+                        "{tool} {}",
+                        enabled_label(tool_enabled(&self.draft, tool), messages)
+                    );
                 }
             }
             Focus::Fields => {
@@ -1029,7 +1419,7 @@ impl InitTuiApp {
                             self.mark_dirty();
                             self.status = format!(
                                 "{tool} {}",
-                                enabled_label(tool_enabled(&self.draft, tool))
+                                enabled_label(tool_enabled(&self.draft, tool), messages)
                             );
                         }
                         FieldTarget::Action(action) => {
@@ -1039,18 +1429,25 @@ impl InitTuiApp {
                     }
                 }
             }
+            Focus::SidePanel => {}
         }
         None
     }
 
     fn start_edit_or_focus_fields(&mut self) -> Option<AppExit> {
+        let messages = self.messages();
+        if self.focus == Focus::SidePanel {
+            self.open_context_panel();
+            return None;
+        }
+
         if self.focus == Focus::Menu {
             match current_menu_entry(self.menu_index) {
-                MenuEntry::Preview => self.open_preview(),
+                MenuEntry::Preview => self.focus_context_panel(),
                 _ => {
                     self.focus = Focus::Fields;
                     if matches!(current_menu_entry(self.menu_index), MenuEntry::Actions) {
-                        self.status = "Select an action and press Enter.".to_string();
+                        self.status = tui_text(messages, TuiText::SelectAction).to_string();
                     }
                 }
             }
@@ -1062,7 +1459,10 @@ impl InitTuiApp {
             FieldTarget::ToolEnabled(tool) => {
                 toggle_tool(&mut self.draft, tool);
                 self.mark_dirty();
-                self.status = format!("{tool} {}", enabled_label(tool_enabled(&self.draft, tool)));
+                self.status = format!(
+                    "{tool} {}",
+                    enabled_label(tool_enabled(&self.draft, tool), messages)
+                );
                 return None;
             }
             FieldTarget::Action(action) => {
@@ -1087,92 +1487,189 @@ impl InitTuiApp {
     fn open_preview(&mut self) {
         self.preview_expanded = true;
         self.action_expanded = false;
-        self.status = "Full preview: arrows scroll, PgUp/PgDn page, P returns".to_string();
+        self.status = tui_text(self.messages(), TuiText::FullPreviewStatus).to_string();
     }
 
     fn close_preview(&mut self) {
         self.preview_expanded = false;
-        self.status = "Returned to editor. P opens full preview again.".to_string();
+        self.status = tui_text(self.messages(), TuiText::ReturnedEditor).to_string();
+    }
+
+    fn focus_context_panel(&mut self) {
+        self.preview_expanded = false;
+        self.action_expanded = false;
+        self.focus = Focus::SidePanel;
+        self.status = if matches!(current_menu_entry(self.menu_index), MenuEntry::Actions) {
+            tui_text(self.messages(), TuiText::ActionsFocused).to_string()
+        } else {
+            tui_text(self.messages(), TuiText::PreviewFocused).to_string()
+        };
+    }
+
+    fn toggle_side_panel_focus(&mut self) {
+        if self.focus == Focus::SidePanel {
+            self.focus = Focus::Fields;
+            self.status = tui_text(self.messages(), TuiText::ReturnedFields).to_string();
+        } else {
+            self.focus_context_panel();
+        }
+    }
+
+    fn toggle_language(&mut self) {
+        self.options.language = match self.options.language {
+            Language::En => Language::Zh,
+            Language::Zh => Language::En,
+        };
+        self.status = match self.options.language {
+            Language::En => "Language switched to English".to_string(),
+            Language::Zh => "已切换为中文".to_string(),
+        };
+    }
+
+    fn open_context_panel(&mut self) {
+        if matches!(current_menu_entry(self.menu_index), MenuEntry::Actions) {
+            self.open_action_output();
+        } else {
+            self.open_preview();
+        }
     }
 
     fn open_action_output(&mut self) {
         self.action_expanded = true;
         self.preview_expanded = false;
         self.menu_index = action_menu_index();
-        self.status = "Full action output: arrows scroll, PgUp/PgDn page, P returns".to_string();
+        self.status = tui_text(self.messages(), TuiText::FullActionOutputStatus).to_string();
     }
 
     fn close_action_output(&mut self) {
         self.action_expanded = false;
-        self.status = "Returned to actions. P opens full output again.".to_string();
+        self.status = tui_text(self.messages(), TuiText::ReturnedActions).to_string();
     }
 
     fn run_action(&mut self, action: ActionTarget) -> Option<AppExit> {
+        let messages = self.messages();
         match action {
             ActionTarget::SaveConfig => {
                 self.start_save_action();
                 None
             }
             ActionTarget::RunCheck => {
-                self.start_action_task("Check environment", |draft, options| {
-                    let config = config_from_draft(&draft)?;
-                    let report = build_doctor_report(&config);
-                    Ok(doctor_output(report, &options))
-                });
+                self.start_action_task(
+                    messages.text(Text::CheckEnvironment),
+                    |draft, options, progress| {
+                        let messages = Messages::new(options.language);
+                        progress.update(tui_text(messages, TuiText::RenderingEffectiveConfig));
+                        let config = config_from_draft(&draft)?;
+                        progress.update_detail(
+                            tui_text(messages, TuiText::InspectingLocalTools),
+                            "PATH, versions, managers",
+                        );
+                        let report = build_doctor_report(&config);
+                        progress.update(tui_text(messages, TuiText::FormattingDoctorReport));
+                        Ok(doctor_output(report, &options))
+                    },
+                );
                 None
             }
             ActionTarget::PreviewSync => {
-                self.start_action_task("Preview sync", |draft, options| {
-                    let config = config_from_draft(&draft)?;
-                    let report = build_doctor_report(&config);
-                    let plan = build_sync_plan(true, &options.output, &config, &report);
-                    Ok(sync_plan_output(plan))
-                });
+                self.start_action_task(
+                    messages.text(Text::PreviewSync),
+                    |draft, options, progress| {
+                        let messages = Messages::new(options.language);
+                        progress.update(tui_text(messages, TuiText::RenderingEffectiveConfig));
+                        let config = config_from_draft(&draft)?;
+                        progress.update_detail(
+                            tui_text(messages, TuiText::InspectingLocalTools),
+                            "PATH, versions, managers",
+                        );
+                        let report = build_doctor_report(&config);
+                        progress.update(tui_text(messages, TuiText::BuildingSyncGraph));
+                        let plan = build_sync_plan(true, &options.output, &config, &report);
+                        progress.update(tui_text(messages, TuiText::FormattingSyncPreview));
+                        Ok(sync_plan_output(plan, messages))
+                    },
+                );
                 None
             }
             ActionTarget::ApplySync => {
                 if self.action_task.is_some() {
-                    self.status = "An action is already running.".to_string();
+                    self.status = tui_text(messages, TuiText::ActionRunningWait).to_string();
                 } else {
                     self.confirm = Some(ConfirmState {
                         action,
-                        title: "Apply sync".to_string(),
-                        message: "This can run install commands and update managed shell snippets."
-                            .to_string(),
+                        title: messages.text(Text::ApplySync).to_string(),
+                        message: tui_text(messages, TuiText::ConfirmApply).to_string(),
                     });
-                    self.status = "Confirm apply sync from the popup.".to_string();
+                    self.status = tui_text(messages, TuiText::ConfirmApplyStatus).to_string();
                 }
                 None
             }
-            ActionTarget::Finish => self.finish(),
         }
     }
 
     fn start_save_action(&mut self) {
+        let messages = self.messages();
         let allow_overwrite = self.options.force || self.saved_once;
-        self.start_action_task("Save config", move |draft, options| {
-            save_config_output(&draft, &options, allow_overwrite)
-        });
+        self.start_action_task(
+            messages.text(Text::SaveConfig),
+            move |draft, options, progress| {
+                let messages = Messages::new(options.language);
+                progress.update(tui_text(messages, TuiText::RenderingToml));
+                progress.update_detail(
+                    tui_text(messages, TuiText::WritingOutput),
+                    if options.stdout {
+                        tui_text(messages, TuiText::StdoutPreview).to_string()
+                    } else {
+                        options.output.display().to_string()
+                    },
+                );
+                save_config_output(&draft, &options, allow_overwrite)
+            },
+        );
     }
 
     fn start_apply_sync_action(&mut self) {
-        self.start_action_task("Apply sync", |draft, options| {
-            let config = config_from_draft(&draft)?;
-            let report = build_doctor_report(&config);
-            let plan = build_sync_plan(false, &options.output, &config, &report);
-            let execution = execute_sync_plan(&plan, &config);
-            Ok(sync_execution_output(execution))
-        });
+        let messages = self.messages();
+        self.start_action_task(
+            messages.text(Text::ApplySync),
+            |draft, options, progress| {
+                let messages = Messages::new(options.language);
+                progress.update(tui_text(messages, TuiText::RenderingEffectiveConfig));
+                let config = config_from_draft(&draft)?;
+                progress.update_detail(
+                    tui_text(messages, TuiText::InspectingLocalTools),
+                    "PATH, versions, managers",
+                );
+                let report = build_doctor_report(&config);
+                progress.update(tui_text(messages, TuiText::BuildingSyncGraph));
+                let plan = build_sync_plan(false, &options.output, &config, &report);
+                let execution =
+                    execute_sync_plan_with_progress(&plan, &config, |step, current, total| {
+                        progress.update_step(
+                            current,
+                            total,
+                            format!("{} {}", kind_label(&step.kind, messages), step.target),
+                            step.reason.clone(),
+                        );
+                    });
+                progress.update(tui_text(messages, TuiText::FormattingSyncExecution));
+                Ok(sync_execution_output(execution, messages))
+            },
+        );
     }
 
-    fn start_action_task<F>(&mut self, title: &'static str, work: F)
+    fn start_action_task<F>(&mut self, title: impl Into<String>, work: F)
     where
-        F: FnOnce(InitDraft, InitTuiOptions) -> Result<ActionOutput> + Send + 'static,
+        F: FnOnce(InitDraft, InitTuiOptions, ActionProgressReporter) -> Result<ActionOutput>
+            + Send
+            + 'static,
     {
         if self.action_task.is_some() {
-            self.status = "An action is already running.".to_string();
+            self.status = tui_text(self.messages(), TuiText::ActionRunningWait).to_string();
             return;
         }
+        let title = title.into();
+        let messages = self.messages();
         self.menu_index = action_menu_index();
         self.focus = Focus::Fields;
         self.preview_expanded = false;
@@ -1181,24 +1678,40 @@ impl InitTuiApp {
         let draft = self.draft.clone();
         let options = self.options.clone();
         let (sender, receiver) = mpsc::channel();
+        let reporter = ActionProgressReporter {
+            sender: sender.clone(),
+        };
         thread::spawn(move || {
-            let result = work(draft, options).map_err(|error| error.to_string());
-            let _ = sender.send(result);
+            let result = work(draft, options, reporter).map_err(|error| error.to_string());
+            let _ = sender.send(ActionTaskMessage::Finished(result));
         });
         self.action_task = Some(ActionTaskState {
-            title: title.to_string(),
+            title: title.clone(),
+            progress: ActionProgress::new(tui_text(messages, TuiText::Starting)),
             receiver,
         });
-        self.status = format!("{title} running...");
+        self.status = format!("{title} {}...", messages.text(Text::Running));
     }
 
     fn poll_action_task(&mut self) {
-        let Some(task) = &self.action_task else {
+        let messages = self.messages();
+        let Some(task) = &mut self.action_task else {
             return;
         };
-        let Ok(result) = task.receiver.try_recv() else {
-            return;
-        };
+        let mut finished = None;
+        while let Ok(message) = task.receiver.try_recv() {
+            match message {
+                ActionTaskMessage::Progress(progress) => {
+                    self.status = format!("{}: {}", task.title, progress.label);
+                    task.progress = progress;
+                }
+                ActionTaskMessage::Finished(result) => {
+                    finished = Some(result);
+                    break;
+                }
+            }
+        }
+        let Some(result) = finished else { return };
         let title = self.action_task.take().expect("action task checked").title;
         match result {
             Ok(output) => {
@@ -1207,20 +1720,24 @@ impl InitTuiApp {
                     self.dirty = false;
                 }
                 self.status = if output.ok {
-                    format!("{title} finished")
+                    format!("{title} {}", tui_text(messages, TuiText::Finished))
                 } else {
-                    format!("{title} finished with issues")
+                    format!(
+                        "{title} {}",
+                        tui_text(messages, TuiText::FinishedWithIssues)
+                    )
                 };
                 self.action_output = Some(output);
             }
             Err(error) => {
-                self.status = format!("{title} failed");
-                self.action_output = Some(ActionOutput::error(title, error));
+                self.status = format!("{title} {}", tui_text(messages, TuiText::Failed));
+                self.action_output = Some(ActionOutput::error(title, error, messages));
             }
         }
     }
 
     fn handle_confirm_key(&mut self, key: KeyEvent) -> Option<AppExit> {
+        let messages = self.messages();
         let confirm = self.confirm.take().expect("confirm checked");
         match key.code {
             KeyCode::Char('a') | KeyCode::Char('A') | KeyCode::Char('y') | KeyCode::Char('Y') => {
@@ -1229,10 +1746,14 @@ impl InitTuiApp {
                 }
             }
             KeyCode::Char('q') | KeyCode::Char('Q') => {
-                self.status = format!("{} cancelled", confirm.title);
+                self.status = format!(
+                    "{} {}",
+                    confirm.title,
+                    tui_text(messages, TuiText::Cancelled)
+                );
             }
             KeyCode::Esc => {
-                self.status = "Use A to apply or Q to cancel; Esc is ignored.".to_string();
+                self.status = tui_text(messages, TuiText::ApplyConfirmHint).to_string();
                 self.confirm = Some(confirm);
             }
             _ => {
@@ -1243,8 +1764,9 @@ impl InitTuiApp {
     }
 
     fn finish(&mut self) -> Option<AppExit> {
+        let messages = self.messages();
         if self.action_task.is_some() {
-            self.status = "An action is running; wait for it to finish.".to_string();
+            self.status = tui_text(messages, TuiText::ActionRunningWait).to_string();
             return None;
         }
         if self.options.stdout {
@@ -1270,9 +1792,12 @@ impl InitTuiApp {
                 self.focus = Focus::Fields;
                 self.preview_expanded = false;
                 self.action_expanded = false;
-                self.action_output =
-                    Some(ActionOutput::error("Finish".to_string(), error.to_string()));
-                self.status = "Finish failed; fix the output path or use --force.".to_string();
+                self.action_output = Some(ActionOutput::error(
+                    messages.text(Text::Finish).to_string(),
+                    error.to_string(),
+                    messages,
+                ));
+                self.status = tui_text(messages, TuiText::FinishFailed).to_string();
                 None
             }
         }
@@ -1286,7 +1811,10 @@ impl InitTuiApp {
         thread::spawn(move || {
             let _ = sender.send(lookup_version_candidates(tool));
         });
-        self.status = format!("Loading {tool} versions...");
+        self.status = format!(
+            "{} {tool}...",
+            tui_text(self.messages(), TuiText::LoadingVersions)
+        );
         self.version_fetch = Some(VersionFetchState {
             target: field.target,
             label: field.label,
@@ -1312,9 +1840,12 @@ impl InitTuiApp {
             candidates,
         ));
         self.status = if is_empty {
-            "No remote versions loaded; enter a custom selector".to_string()
+            tui_text(self.messages(), TuiText::CustomVersionPrompt).to_string()
         } else {
-            format!("Loaded versions from {source}")
+            format!(
+                "{} {source}",
+                tui_text(self.messages(), TuiText::LoadingVersionsFor)
+            )
         };
     }
 
@@ -1349,7 +1880,11 @@ impl InitTuiApp {
     fn action_output_max_scroll(&self) -> u16 {
         self.action_output
             .as_ref()
-            .map(|output| output.lines.len().saturating_sub(1).min(u16::MAX as usize) as u16)
+            .map(|output| {
+                action_output_line_count(&output.lines)
+                    .saturating_sub(1)
+                    .min(u16::MAX as usize) as u16
+            })
             .unwrap_or_default()
     }
 
@@ -1372,7 +1907,7 @@ impl InitTuiApp {
     }
 }
 
-fn render_edit_popup(frame: &mut Frame, area: Rect, edit: &EditState) {
+fn render_edit_popup(frame: &mut Frame, area: Rect, edit: &EditState, messages: Messages) {
     let popup = centered_rect(62, 9, area);
     frame.render_widget(Clear, popup);
     let content = vec![
@@ -1385,12 +1920,12 @@ fn render_edit_popup(frame: &mut Frame, area: Rect, edit: &EditState) {
         Line::from(""),
         Line::from(edit.buffer.as_str()),
         Line::from(""),
-        Line::from("Enter save   Ctrl+G cancel   Backspace delete"),
+        Line::from(tui_text(messages, TuiText::EnterSaveCancel)),
     ];
     let paragraph = Paragraph::new(content)
         .block(
             Block::default()
-                .title(" Edit ")
+                .title(format!(" {} ", messages.text(Text::Edit)))
                 .borders(Borders::ALL)
                 .border_style(Style::default().fg(Color::Cyan))
                 .padding(Padding::horizontal(1)),
@@ -1399,25 +1934,38 @@ fn render_edit_popup(frame: &mut Frame, area: Rect, edit: &EditState) {
     frame.render_widget(paragraph, popup);
 }
 
-fn render_version_loading_popup(frame: &mut Frame, area: Rect, fetch: &VersionFetchState) {
+fn render_version_loading_popup(
+    frame: &mut Frame,
+    area: Rect,
+    fetch: &VersionFetchState,
+    messages: Messages,
+) {
     let popup = centered_rect(68, 9, area);
     frame.render_widget(Clear, popup);
     let content = vec![
         Line::from(Span::styled(
-            format!("Loading versions for {}", fetch.label),
+            format!(
+                "{} {}",
+                tui_text(messages, TuiText::LoadingVersionsFor),
+                fetch.label
+            ),
             Style::default()
                 .fg(Color::Yellow)
                 .add_modifier(Modifier::BOLD),
         )),
         Line::from(""),
-        Line::from(format!("Current value: {}", fetch.current)),
+        Line::from(format!(
+            "{}: {}",
+            tui_text(messages, TuiText::CurrentValue),
+            fetch.current
+        )),
         Line::from(""),
-        Line::from("Press C to type a custom selector now, or Q to cancel."),
+        Line::from(tui_text(messages, TuiText::CustomSelectorNow)),
     ];
     let paragraph = Paragraph::new(content)
         .block(
             Block::default()
-                .title(" Versions ")
+                .title(format!(" {} ", messages.text(Text::Versions)))
                 .borders(Borders::ALL)
                 .border_style(Style::default().fg(Color::Cyan))
                 .padding(Padding::horizontal(1)),
@@ -1426,11 +1974,20 @@ fn render_version_loading_popup(frame: &mut Frame, area: Rect, fetch: &VersionFe
     frame.render_widget(paragraph, popup);
 }
 
-fn render_version_picker(frame: &mut Frame, area: Rect, picker: &VersionPickerState) {
+fn render_version_picker(
+    frame: &mut Frame,
+    area: Rect,
+    picker: &VersionPickerState,
+    messages: Messages,
+) {
     let popup = centered_rect(76, 18, area);
     frame.render_widget(Clear, popup);
     let block = Block::default()
-        .title(format!(" Version - {} ", picker.label))
+        .title(format!(
+            " {} - {} ",
+            tui_text(messages, TuiText::Version),
+            picker.label
+        ))
         .borders(Borders::ALL)
         .border_style(Style::default().fg(Color::Cyan))
         .padding(Padding::horizontal(1));
@@ -1447,7 +2004,7 @@ fn render_version_picker(frame: &mut Frame, area: Rect, picker: &VersionPickerSt
         .split(inner);
 
     let mut header = vec![Line::from(vec![
-        Span::raw("Source: "),
+        Span::raw(format!("{}: ", tui_text(messages, TuiText::Source))),
         Span::styled(picker.source.as_str(), Style::default().fg(Color::Green)),
     ])];
     if let Some(note) = &picker.note {
@@ -1458,7 +2015,7 @@ fn render_version_picker(frame: &mut Frame, area: Rect, picker: &VersionPickerSt
     if picker.custom_mode {
         let content = vec![
             Line::from(Span::styled(
-                "Custom version selector",
+                tui_text(messages, TuiText::CustomVersionSelector),
                 Style::default()
                     .fg(Color::Yellow)
                     .add_modifier(Modifier::BOLD),
@@ -1510,16 +2067,16 @@ fn render_version_picker(frame: &mut Frame, area: Rect, picker: &VersionPickerSt
     }
 
     let footer = if picker.custom_mode && picker.choices.is_empty() {
-        "Enter apply   Ctrl+G cancel   Backspace delete"
+        tui_text(messages, TuiText::EnterApplyCancel)
     } else if picker.custom_mode {
-        "Enter apply   Ctrl+G list   Backspace delete"
+        tui_text(messages, TuiText::EnterApplyList)
     } else {
-        "Enter select   C custom   type a number to enter custom   Q cancel"
+        tui_text(messages, TuiText::EnterSelectCustom)
     };
     frame.render_widget(Paragraph::new(footer), chunks[2]);
 }
 
-fn render_confirm_popup(frame: &mut Frame, area: Rect, confirm: &ConfirmState) {
+fn render_confirm_popup(frame: &mut Frame, area: Rect, confirm: &ConfirmState, messages: Messages) {
     let popup = centered_rect(72, 9, area);
     frame.render_widget(Clear, popup);
     let content = vec![
@@ -1532,12 +2089,12 @@ fn render_confirm_popup(frame: &mut Frame, area: Rect, confirm: &ConfirmState) {
         Line::from(""),
         Line::from(confirm.message.as_str()),
         Line::from(""),
-        Line::from("A apply   Q cancel"),
+        Line::from(tui_text(messages, TuiText::ApplyCancel)),
     ];
     let paragraph = Paragraph::new(content)
         .block(
             Block::default()
-                .title(" Confirm ")
+                .title(format!(" {} ", messages.text(Text::Confirm)))
                 .borders(Borders::ALL)
                 .border_style(Style::default().fg(Color::Red))
                 .padding(Padding::horizontal(1)),
@@ -1546,10 +2103,15 @@ fn render_confirm_popup(frame: &mut Frame, area: Rect, confirm: &ConfirmState) {
     frame.render_widget(paragraph, popup);
 }
 
-fn render_action_loading_popup(frame: &mut Frame, area: Rect, task: &ActionTaskState) {
-    let popup = centered_rect(64, 7, area);
+fn render_action_loading_popup(
+    frame: &mut Frame,
+    area: Rect,
+    task: &ActionTaskState,
+    messages: Messages,
+) {
+    let popup = centered_rect(68, 9, area);
     frame.render_widget(Clear, popup);
-    let content = vec![
+    let mut content = vec![
         Line::from(Span::styled(
             task.title.as_str(),
             Style::default()
@@ -1557,12 +2119,21 @@ fn render_action_loading_popup(frame: &mut Frame, area: Rect, task: &ActionTaskS
                 .add_modifier(Modifier::BOLD),
         )),
         Line::from(""),
-        Line::from("Running inside the TUI..."),
+        Line::from(task.progress.label.as_str()),
     ];
+    if let (Some(current), Some(total)) = (task.progress.current, task.progress.total) {
+        content.push(Line::from(format!(
+            "{} {current}/{total}",
+            tui_text(messages, TuiText::Step)
+        )));
+    }
+    if let Some(detail) = &task.progress.detail {
+        content.push(Line::from(detail.as_str()));
+    }
     let paragraph = Paragraph::new(content)
         .block(
             Block::default()
-                .title(" Working ")
+                .title(format!(" {} ", tui_text(messages, TuiText::Working)))
                 .borders(Borders::ALL)
                 .border_style(Style::default().fg(Color::Cyan))
                 .padding(Padding::horizontal(1)),
@@ -1640,27 +2211,84 @@ impl ActionOutput {
         }
     }
 
-    fn saved(result: InitWriteResult) -> Self {
+    fn saved(result: InitWriteResult, messages: Messages) -> Self {
         let action = if result.overwritten {
-            "Overwrote"
+            messages.text(Text::Overwrote)
         } else {
-            "Wrote"
+            messages.text(Text::Wrote)
         };
         Self {
-            title: "Saved config".to_string(),
+            title: messages.text(Text::SavedConfig).to_string(),
             lines: vec![format!("{action} {}", result.path.display())],
             ok: true,
             mark_saved: true,
         }
     }
 
-    fn error(title: String, error: String) -> Self {
+    fn error(title: String, error: String, messages: Messages) -> Self {
         Self {
             title,
-            lines: vec!["Error".to_string(), String::new(), error],
+            lines: vec![messages.text(Text::Error).to_string(), String::new(), error],
             ok: false,
             mark_saved: false,
         }
+    }
+}
+
+impl ActionProgress {
+    fn new(label: impl Into<String>) -> Self {
+        Self {
+            label: label.into(),
+            detail: None,
+            current: None,
+            total: None,
+        }
+    }
+
+    fn with_detail(label: impl Into<String>, detail: impl Into<String>) -> Self {
+        Self {
+            label: label.into(),
+            detail: Some(detail.into()),
+            current: None,
+            total: None,
+        }
+    }
+
+    fn step(
+        current: usize,
+        total: usize,
+        label: impl Into<String>,
+        detail: impl Into<String>,
+    ) -> Self {
+        Self {
+            label: label.into(),
+            detail: Some(detail.into()),
+            current: Some(current),
+            total: Some(total),
+        }
+    }
+}
+
+impl ActionProgressReporter {
+    fn update(&self, label: impl Into<String>) {
+        let progress = ActionProgress::new(label);
+        let _ = self.sender.send(ActionTaskMessage::Progress(progress));
+    }
+
+    fn update_detail(&self, label: impl Into<String>, detail: impl Into<String>) {
+        let progress = ActionProgress::with_detail(label, detail);
+        let _ = self.sender.send(ActionTaskMessage::Progress(progress));
+    }
+
+    fn update_step(
+        &self,
+        current: usize,
+        total: usize,
+        label: impl Into<String>,
+        detail: impl Into<String>,
+    ) {
+        let progress = ActionProgress::step(current, total, label, detail);
+        let _ = self.sender.send(ActionTaskMessage::Progress(progress));
     }
 }
 
@@ -1686,10 +2314,13 @@ fn current_menu_entry(index: usize) -> MenuEntry {
         .unwrap_or(MenuEntry::Policy)
 }
 
-fn menu_line(draft: &InitDraft, entry: MenuEntry) -> Line<'static> {
+fn menu_line(draft: &InitDraft, entry: MenuEntry, messages: Messages) -> Line<'static> {
     match entry {
         MenuEntry::Policy => Line::from(vec![
-            Span::styled("policy", Style::default().fg(Color::Yellow)),
+            Span::styled(
+                messages.text(Text::Policy),
+                Style::default().fg(Color::Yellow),
+            ),
             Span::raw(format!(
                 "  {} / {}",
                 draft.policy.channel, draft.policy.platform
@@ -1707,7 +2338,7 @@ fn menu_line(draft: &InitDraft, entry: MenuEntry) -> Line<'static> {
                 Span::styled(marker, Style::default().fg(color)),
                 Span::raw(" "),
                 Span::styled(tool.to_string(), Style::default().fg(color)),
-                Span::raw(format!("  {}", tool_summary(draft, tool))),
+                Span::raw(format!("  {}", tool_summary(draft, tool, messages))),
             ])
         }
         MenuEntry::Homebrew => Line::from(vec![
@@ -1718,31 +2349,37 @@ fn menu_line(draft: &InitDraft, entry: MenuEntry) -> Line<'static> {
             )),
         ]),
         MenuEntry::Npm => Line::from(vec![
-            Span::styled("npm globals", Style::default().fg(Color::Yellow)),
+            Span::styled(
+                messages.text(Text::NpmGlobals),
+                Style::default().fg(Color::Yellow),
+            ),
             Span::raw(format!(
                 "  {}",
                 package_count(draft.npm_config.as_ref().map(|npm| &npm.global_packages))
             )),
         ]),
         MenuEntry::Actions => Line::from(vec![
-            Span::styled("actions", Style::default().fg(Color::Green)),
+            Span::styled(
+                messages.text(Text::Actions),
+                Style::default().fg(Color::Green),
+            ),
             Span::raw("  save / check / sync"),
         ]),
         MenuEntry::Preview => Line::from(vec![Span::styled(
-            "preview",
+            messages.text(Text::Preview),
             Style::default().fg(Color::Magenta),
         )]),
     }
 }
 
-fn entry_title(entry: MenuEntry) -> &'static str {
+fn entry_title(entry: MenuEntry, messages: Messages) -> String {
     match entry {
-        MenuEntry::Policy => "Policy",
-        MenuEntry::Tool(tool) => tool,
-        MenuEntry::Homebrew => "Homebrew packages",
-        MenuEntry::Npm => "npm globals",
-        MenuEntry::Actions => "Actions",
-        MenuEntry::Preview => "Preview",
+        MenuEntry::Policy => messages.text(Text::Policy).to_string(),
+        MenuEntry::Tool(tool) => tool.to_string(),
+        MenuEntry::Homebrew => messages.text(Text::HomebrewPackages).to_string(),
+        MenuEntry::Npm => messages.text(Text::NpmGlobals).to_string(),
+        MenuEntry::Actions => messages.text(Text::Actions).to_string(),
+        MenuEntry::Preview => messages.text(Text::Preview).to_string(),
     }
 }
 
@@ -1761,7 +2398,7 @@ fn entry_accent(entry: MenuEntry) -> Color {
 fn field_label_style(target: &FieldTarget) -> Style {
     let color = match target {
         FieldTarget::Action(ActionTarget::ApplySync) => Color::Red,
-        FieldTarget::Action(ActionTarget::Finish | ActionTarget::SaveConfig) => Color::Green,
+        FieldTarget::Action(ActionTarget::SaveConfig) => Color::Green,
         FieldTarget::Action(_) => Color::Cyan,
         FieldTarget::ToolEnabled(_) => Color::Yellow,
         FieldTarget::NodeVersion | FieldTarget::GoVersion | FieldTarget::RustChannel => {
@@ -1778,7 +2415,7 @@ fn field_value_style(target: &FieldTarget, value: &str) -> Style {
         FieldTarget::ToolEnabled(_) if truthy(value) => Color::Green,
         FieldTarget::ToolEnabled(_) => Color::DarkGray,
         FieldTarget::Action(ActionTarget::ApplySync) => Color::Red,
-        FieldTarget::Action(ActionTarget::Finish | ActionTarget::SaveConfig) => Color::Green,
+        FieldTarget::Action(ActionTarget::SaveConfig) => Color::Green,
         FieldTarget::Action(_) => Color::White,
         FieldTarget::NodeVersion | FieldTarget::GoVersion | FieldTarget::RustChannel => {
             Color::Magenta
@@ -1795,27 +2432,28 @@ fn field_value_style(target: &FieldTarget, value: &str) -> Style {
 }
 
 fn field_rows(draft: &InitDraft, entry: MenuEntry, options: &InitTuiOptions) -> Vec<FieldRow> {
+    let messages = Messages::new(options.language);
     match entry {
         MenuEntry::Policy => vec![
             FieldRow {
-                label: "channel".to_string(),
+                label: messages.text(Text::Channel).to_string(),
                 value: draft.policy.channel.clone(),
                 target: FieldTarget::PolicyChannel,
             },
             FieldRow {
-                label: "platform".to_string(),
+                label: messages.text(Text::Platform).to_string(),
                 value: draft.policy.platform.clone(),
                 target: FieldTarget::PolicyPlatform,
             },
         ],
-        MenuEntry::Tool(tool) => tool_field_rows(draft, tool),
+        MenuEntry::Tool(tool) => tool_field_rows(draft, tool, messages),
         MenuEntry::Homebrew => vec![FieldRow {
-            label: "packages".to_string(),
+            label: messages.text(Text::PackageList).to_string(),
             value: list_value(draft.cli.as_ref().map(|cli| &cli.packages)),
             target: FieldTarget::HomebrewPackages,
         }],
         MenuEntry::Npm => vec![FieldRow {
-            label: "global packages".to_string(),
+            label: messages.text(Text::PackageList).to_string(),
             value: list_value(draft.npm_config.as_ref().map(|npm| &npm.global_packages)),
             target: FieldTarget::NpmGlobals,
         }],
@@ -1825,40 +2463,32 @@ fn field_rows(draft: &InitDraft, entry: MenuEntry, options: &InitTuiOptions) -> 
 }
 
 fn action_field_rows(options: &InitTuiOptions) -> Vec<FieldRow> {
+    let messages = Messages::new(options.language);
     let output = if options.stdout {
-        "show generated TOML".to_string()
+        tui_text(messages, TuiText::ShowGeneratedToml).to_string()
     } else {
         options.output.display().to_string()
     };
     vec![
         FieldRow {
-            label: "save config".to_string(),
+            label: messages.text(Text::SaveConfig).to_string(),
             value: output,
             target: FieldTarget::Action(ActionTarget::SaveConfig),
         },
         FieldRow {
-            label: "run check".to_string(),
-            value: "doctor against current policy".to_string(),
+            label: messages.text(Text::RunCheck).to_string(),
+            value: tui_text(messages, TuiText::DoctorAgainstPolicy).to_string(),
             target: FieldTarget::Action(ActionTarget::RunCheck),
         },
         FieldRow {
-            label: "preview sync".to_string(),
-            value: "dry-run plan".to_string(),
+            label: messages.text(Text::PreviewSync).to_string(),
+            value: tui_text(messages, TuiText::DryRunPlan).to_string(),
             target: FieldTarget::Action(ActionTarget::PreviewSync),
         },
         FieldRow {
-            label: "apply sync".to_string(),
-            value: "install/configure now".to_string(),
+            label: messages.text(Text::ApplySync).to_string(),
+            value: tui_text(messages, TuiText::InstallConfigureNow).to_string(),
             target: FieldTarget::Action(ActionTarget::ApplySync),
-        },
-        FieldRow {
-            label: "finish".to_string(),
-            value: if options.stdout {
-                "print TOML and exit".to_string()
-            } else {
-                "save and exit".to_string()
-            },
-            target: FieldTarget::Action(ActionTarget::Finish),
         },
     ]
 }
@@ -1869,18 +2499,19 @@ fn save_config_output(
     force: bool,
 ) -> Result<ActionOutput> {
     let document = render_init_document(draft);
+    let messages = Messages::new(options.language);
     if options.stdout {
         let mut lines = vec![
-            "Generated TOML".to_string(),
-            "Finish will print this document after leaving the TUI.".to_string(),
+            messages.text(Text::GeneratedToml).to_string(),
+            tui_text(messages, TuiText::ShowGeneratedToml).to_string(),
             String::new(),
         ];
         lines.extend(document.content.lines().map(ToString::to_string));
-        return Ok(ActionOutput::ok("Generated TOML", lines));
+        return Ok(ActionOutput::ok(messages.text(Text::GeneratedToml), lines));
     }
 
     let result = write_init_document(&options.output, force, &document)?;
-    Ok(ActionOutput::saved(result))
+    Ok(ActionOutput::saved(result, messages))
 }
 
 fn config_from_draft(draft: &InitDraft) -> Result<DevkitConfig> {
@@ -1891,49 +2522,85 @@ fn config_from_draft(draft: &InitDraft) -> Result<DevkitConfig> {
 }
 
 fn doctor_output(report: DoctorReport, options: &InitTuiOptions) -> ActionOutput {
+    let messages = Messages::new(options.language);
+    let ok_count = report
+        .tools
+        .iter()
+        .filter(|tool| matches!(tool.status, Status::Ok))
+        .count();
+    let missing_count = report
+        .tools
+        .iter()
+        .filter(|tool| matches!(tool.status, Status::Missing))
+        .count();
+    let mismatch_count = report
+        .tools
+        .iter()
+        .filter(|tool| matches!(tool.status, Status::Mismatch))
+        .count();
+    let unknown_count = report
+        .tools
+        .iter()
+        .filter(|tool| matches!(tool.status, Status::Unknown))
+        .count();
     let mut lines = vec![
-        "Doctor report".to_string(),
+        messages.text(Text::DoctorReport).to_string(),
         format!(
-            "Policy source: {}",
+            "{}: {}",
+            tui_text(messages, TuiText::Source),
             if options.stdout {
                 "current TUI draft".to_string()
             } else {
                 options.output.display().to_string()
             }
         ),
+        format!(
+            "{}: {ok_count} {}, {missing_count} {}, {mismatch_count} {}, {unknown_count} {}",
+            messages.text(Text::Summary),
+            messages.label(Label::Ok),
+            messages.label(Label::Missing),
+            messages.label(Label::Mismatch),
+            messages.label(Label::Unknown),
+        ),
         String::new(),
-        "Tools".to_string(),
+        messages.text(Text::Tools).to_string(),
     ];
     for tool in &report.tools {
-        lines.push(format!(
-            "- {:<9} {:<8} current {:<12} required {:<12} {}",
-            tool.name,
-            status_label(&tool.status),
-            tool.current.as_deref().unwrap_or("-"),
-            tool.required.as_deref().unwrap_or("-"),
-            tool.path
-                .as_ref()
-                .map(|path| path.display().to_string())
-                .unwrap_or_else(|| "-".to_string())
-        ));
-        if let Some(note) = &tool.note {
-            lines.push(format!("  note: {note}"));
-        }
+        push_doctor_tool_lines(&mut lines, tool, messages);
     }
 
     if report.issues.is_empty() {
         lines.push(String::new());
-        lines.push("Issues: none".to_string());
+        lines.push(format!(
+            "{}: {}",
+            messages.text(Text::Issues),
+            messages.text(Text::None)
+        ));
     } else {
         lines.push(String::new());
-        lines.push("Issues".to_string());
+        lines.push(messages.text(Text::Issues).to_string());
         for issue in &report.issues {
-            lines.push(format!("- {}", issue.message));
+            lines.push(format!(
+                "- [{}] {}",
+                issue_severity_label(issue.severity, messages),
+                issue.message
+            ));
             if let Some(path) = &issue.path {
-                lines.push(format!("  path: {}", path.display()));
+                lines.push(format!(
+                    "  {}: {}",
+                    messages.text(Text::Path),
+                    path.display()
+                ));
+            }
+            for evidence in &issue.evidence {
+                push_issue_evidence_lines(&mut lines, evidence, messages);
             }
             if let Some(fix) = &issue.fix {
-                lines.push(format!("  fix: {fix}"));
+                lines.push(format!(
+                    "  {}: {}",
+                    messages.text(Text::Fix),
+                    compact_issue_fix(fix, &issue.evidence)
+                ));
             }
         }
     }
@@ -1943,26 +2610,404 @@ fn doctor_output(report: DoctorReport, options: &InitTuiOptions) -> ActionOutput
         .iter()
         .all(|tool| matches!(tool.status, Status::Ok) || tool.required.is_none());
     ActionOutput {
-        title: "Check environment".to_string(),
+        title: messages.text(Text::CheckEnvironment).to_string(),
         lines,
         ok,
         mark_saved: false,
     }
 }
 
-fn sync_plan_output(plan: SyncPlan) -> ActionOutput {
+fn push_doctor_tool_lines(lines: &mut Vec<String>, tool: &ToolStatus, messages: Messages) {
+    lines.push(format!(
+        "- {} [{}]",
+        tool.name,
+        status_label(&tool.status, messages)
+    ));
+    lines.push(format!(
+        "  {}: {}",
+        messages.text(Text::Current),
+        tool.current.as_deref().unwrap_or("-")
+    ));
+    lines.push(format!(
+        "  {}: {}",
+        messages.text(Text::Required),
+        tool.required.as_deref().unwrap_or("-")
+    ));
+    if let Some(manager) = &tool.manager {
+        lines.push(format!("  {}: {manager}", messages.text(Text::Manager)));
+    }
+    lines.push(format!(
+        "  {}: {}",
+        messages.text(Text::Command),
+        tool.command
+    ));
+    lines.push(format!(
+        "  {}: {}",
+        messages.text(Text::Path),
+        tool.path
+            .as_ref()
+            .map(|path| path.display().to_string())
+            .unwrap_or_else(|| "-".to_string())
+    ));
+    if tool.path_candidates.len() > 1 {
+        lines.push(format!(
+            "  {}: {}",
+            messages.text(Text::PathCandidates),
+            tool.path_candidates.len()
+        ));
+        for (index, path) in tool.path_candidates.iter().enumerate() {
+            let active = if index == 0 {
+                format!(" ({})", messages.text(Text::Active))
+            } else {
+                String::new()
+            };
+            lines.push(format!("    {}. {}{active}", index + 1, path.display()));
+        }
+    }
+    if let Some(note) = &tool.note {
+        lines.push(format!("  {}: {note}", messages.text(Text::Note)));
+    }
+}
+
+fn push_issue_evidence_lines(
+    lines: &mut Vec<String>,
+    evidence: &IssueEvidence,
+    messages: Messages,
+) {
+    if evidence.key == "candidates" {
+        lines.push(format!("  {}:", messages.text(Text::Candidates)));
+        for (index, candidate) in evidence.value.split("; ").enumerate() {
+            lines.push(format!("    {}. {candidate}", index + 1));
+        }
+    } else {
+        lines.push(format!("  {}: {}", evidence.key, evidence.value));
+    }
+}
+
+fn compact_issue_fix(fix: &str, evidence: &[IssueEvidence]) -> String {
+    if evidence.iter().any(|item| item.key == "candidates")
+        && let Some((summary, _)) = fix.split_once("; candidates:")
+    {
+        return summary.to_string();
+    }
+    fix.to_string()
+}
+
+fn action_output_lines(lines: &[String]) -> Vec<Line<'static>> {
+    lines
+        .iter()
+        .flat_map(|line| line.split('\n').map(styled_action_output_line))
+        .collect()
+}
+
+fn action_output_line_count(lines: &[String]) -> usize {
+    lines.iter().map(|line| line.split('\n').count()).sum()
+}
+
+fn styled_action_output_line(line: &str) -> Line<'static> {
+    if line.is_empty() {
+        return Line::from("");
+    }
+    if let Some(styled) = styled_bracketed_action_line(line) {
+        return styled;
+    }
+    if let Some(styled) = styled_tool_status_line(line) {
+        return styled;
+    }
+    if let Some(styled) = styled_numbered_action_line(line) {
+        return styled;
+    }
+    if line.starts_with("Summary:") || line.starts_with("摘要:") {
+        return styled_summary_line(line);
+    }
+    if line.starts_with("Result:") || line.starts_with("结果:") {
+        return styled_result_line(line);
+    }
+    if let Some(color) = action_section_color(line) {
+        return Line::from(Span::styled(
+            line.to_string(),
+            Style::default().fg(color).add_modifier(Modifier::BOLD),
+        ));
+    }
+    if let Some(styled) = styled_key_value_action_line(line) {
+        return styled;
+    }
+
+    Line::from(Span::raw(line.to_string()))
+}
+
+fn styled_bracketed_action_line(line: &str) -> Option<Line<'static>> {
+    let rest = line.strip_prefix("- [")?;
+    let (label, tail) = rest.split_once(']')?;
+    Some(Line::from(vec![
+        Span::styled("- [", Style::default().fg(Color::DarkGray)),
+        Span::styled(
+            label.to_string(),
+            status_style(label).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled("]", Style::default().fg(Color::DarkGray)),
+        Span::raw(tail.to_string()),
+    ]))
+}
+
+fn styled_tool_status_line(line: &str) -> Option<Line<'static>> {
+    let rest = line.strip_prefix("- ")?;
+    let (name, status) = rest.rsplit_once(" [")?;
+    let status = status.strip_suffix(']')?;
+    if status.is_empty() {
+        return None;
+    }
+
+    Some(Line::from(vec![
+        Span::styled("- ", Style::default().fg(Color::DarkGray)),
+        Span::styled(
+            name.to_string(),
+            Style::default()
+                .fg(Color::White)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(" [", Style::default().fg(Color::DarkGray)),
+        Span::styled(
+            status.to_string(),
+            status_style(status).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled("]", Style::default().fg(Color::DarkGray)),
+    ]))
+}
+
+fn styled_numbered_action_line(line: &str) -> Option<Line<'static>> {
+    let indent_len = line.len() - line.trim_start().len();
+    let indent = &line[..indent_len];
+    let rest = &line[indent_len..];
+    let (number, value) = rest.split_once(". ")?;
+    if !number.chars().all(|character| character.is_ascii_digit()) {
+        return None;
+    }
+
+    let mut spans = vec![
+        Span::raw(indent.to_string()),
+        Span::styled(format!("{number}. "), Style::default().fg(Color::DarkGray)),
+    ];
+    if let Some((path, marker)) = value
+        .strip_suffix(" (active)")
+        .map(|path| (path, " (active)"))
+        .or_else(|| {
+            value
+                .strip_suffix(" (当前生效)")
+                .map(|path| (path, " (当前生效)"))
+        })
+    {
+        spans.push(Span::styled(
+            path.to_string(),
+            Style::default().fg(Color::White),
+        ));
+        spans.push(Span::styled(
+            marker,
+            Style::default()
+                .fg(Color::Green)
+                .add_modifier(Modifier::BOLD),
+        ));
+    } else {
+        spans.push(Span::styled(
+            value.to_string(),
+            Style::default().fg(Color::White),
+        ));
+    }
+    Some(Line::from(spans))
+}
+
+fn styled_summary_line(line: &str) -> Line<'static> {
+    let label = if line.starts_with("摘要:") {
+        "摘要:"
+    } else {
+        "Summary:"
+    };
+    let rest = line.trim_start_matches(label);
+    let mut spans = vec![
+        Span::styled(
+            label,
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::raw(" "),
+    ];
+
+    let rest = rest.trim_start();
+    for (index, part) in rest.split(", ").enumerate() {
+        if index > 0 {
+            spans.push(Span::raw(", "));
+        }
+        spans.push(Span::styled(
+            part.to_string(),
+            Style::default().fg(summary_part_color(part)),
+        ));
+    }
+
+    Line::from(spans)
+}
+
+fn styled_result_line(line: &str) -> Line<'static> {
+    let label = if line.starts_with("结果:") {
+        "结果:"
+    } else {
+        "Result:"
+    };
+    let rest = line.trim_start_matches(label);
+    let color = if rest.contains("matches policy") || rest.contains("已匹配") {
+        Color::Green
+    } else {
+        Color::Yellow
+    };
+    Line::from(vec![
+        Span::styled(
+            label,
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(rest.to_string(), Style::default().fg(color)),
+    ])
+}
+
+fn styled_key_value_action_line(line: &str) -> Option<Line<'static>> {
+    let indent_len = line.len() - line.trim_start().len();
+    let indent = &line[..indent_len];
+    let trimmed = &line[indent_len..];
+    if trimmed.starts_with("- ") {
+        return None;
+    }
+
+    if let Some(key) = trimmed.strip_suffix(':') {
+        return Some(Line::from(vec![
+            Span::raw(indent.to_string()),
+            Span::styled(
+                key.to_string(),
+                Style::default()
+                    .fg(key_value_color(key))
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(":", Style::default().fg(Color::DarkGray)),
+        ]));
+    }
+
+    let (key, value) = trimmed.split_once(": ")?;
+    Some(Line::from(vec![
+        Span::raw(indent.to_string()),
+        Span::styled(
+            key.to_string(),
+            Style::default()
+                .fg(key_value_color(key))
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(": ", Style::default().fg(Color::DarkGray)),
+        Span::styled(
+            value.to_string(),
+            Style::default().fg(if value == "-" {
+                Color::DarkGray
+            } else {
+                Color::White
+            }),
+        ),
+    ]))
+}
+
+fn action_section_color(line: &str) -> Option<Color> {
+    match line {
+        "Doctor report" | "Tools" | "Generated TOML" | "Sync execution" | "环境检查报告"
+        | "工具" | "生成的 TOML" | "同步执行" => Some(Color::Cyan),
+        "Issues" | "问题" => Some(Color::Yellow),
+        "Issues: none" | "问题: 无" => Some(Color::Green),
+        "Ready" | "可执行" => Some(Color::Green),
+        "Blocked" | "Error" | "被阻塞" | "错误" => Some(Color::Red),
+        "Verify" | "验证" => Some(Color::Magenta),
+        _ if line.starts_with("Sync plan") => Some(Color::Cyan),
+        _ if line.starts_with("同步计划") => Some(Color::Cyan),
+        _ => None,
+    }
+}
+
+fn status_style(label: &str) -> Style {
+    Style::default().fg(status_color(label))
+}
+
+fn status_color(label: &str) -> Color {
+    match label {
+        "正常" | "可执行" | "已执行" | "已验证" | "已启用" => return Color::Green,
+        "缺失" | "失败" | "错误" => return Color::Red,
+        "不匹配" | "警告" | "已跳过" | "清理" => return Color::Yellow,
+        "安装" | "配置" => return Color::Cyan,
+        "对齐" => return Color::Magenta,
+        "验证" => return Color::Green,
+        "信息" | "未变化" => return Color::Blue,
+        "未知" | "已禁用" => return Color::DarkGray,
+        _ => {}
+    }
+    match label.to_ascii_lowercase().as_str() {
+        "ok" | "ready" | "applied" | "verified" => Color::Green,
+        "missing" | "failed" | "error" => Color::Red,
+        "mismatch" | "warning" | "skipped" | "cleanup" => Color::Yellow,
+        "install" | "configure" => Color::Cyan,
+        "align" => Color::Magenta,
+        "verify" => Color::Green,
+        "info" | "unchanged" => Color::Blue,
+        "unknown" => Color::DarkGray,
+        _ => Color::White,
+    }
+}
+
+fn summary_part_color(part: &str) -> Color {
+    if part.contains(" ok") || part.contains(" 正常") {
+        Color::Green
+    } else if part.contains(" missing") || part.contains(" 缺失") {
+        Color::Red
+    } else if part.contains(" mismatch") || part.contains(" 不匹配") {
+        Color::Yellow
+    } else if part.contains(" unknown") || part.contains(" 未知") {
+        Color::DarkGray
+    } else {
+        Color::White
+    }
+}
+
+fn key_value_color(key: &str) -> Color {
+    match key {
+        "fix" | "修复" => Color::Green,
+        "blocked by" | "requires sudo" | "note" | "阻塞依赖" | "需要 sudo：是" | "备注" => {
+            Color::Yellow
+        }
+        "command" | "instruction" | "Target channel" | "Target platform" | "Policy source" => {
+            Color::Cyan
+        }
+        "命令" | "操作说明" | "目标通道" | "目标平台" | "来源" => Color::Cyan,
+        "file" | "文件" => Color::Magenta,
+        "path" | "active_path" | "PATH candidates" | "candidates" | "路径" | "PATH 候选"
+        | "候选项" => Color::Blue,
+        "current" | "当前" => Color::Green,
+        "required" | "要求" => Color::Yellow,
+        "manager" | "管理器" => Color::Magenta,
+        "Policy auto-fix" | "Output" | "策略自动修复" | "输出" => Color::Cyan,
+        _ => Color::DarkGray,
+    }
+}
+
+fn sync_plan_output(plan: SyncPlan, messages: Messages) -> ActionOutput {
     let mut lines = vec![format!(
-        "Sync plan{}",
-        if plan.dry_run { " (dry-run)" } else { "" }
+        "{}{}",
+        messages.text(Text::SyncPlan),
+        messages.dry_run_suffix(plan.dry_run)
     )];
     if let Some(channel) = &plan.policy_channel {
-        lines.push(format!("Target channel: {channel}"));
+        lines.push(format!("{}: {channel}", messages.text(Text::TargetChannel)));
     }
     if let Some(platform) = &plan.platform {
-        lines.push(format!("Target platform: {platform}"));
+        lines.push(format!(
+            "{}: {platform}",
+            messages.text(Text::TargetPlatform)
+        ));
     }
     if plan.auto_fix {
-        lines.push("Policy auto-fix: enabled".to_string());
+        lines.push(messages.text(Text::PolicyAutoFixEnabled).to_string());
     }
     lines.push(String::new());
 
@@ -1973,18 +3018,18 @@ fn sync_plan_output(plan: SyncPlan) -> ActionOutput {
         .filter_map(|id| plan.steps.iter().find(|step| step.id == *id))
         .collect::<Vec<_>>();
     if !ready_steps.is_empty() {
-        lines.push("Ready".to_string());
+        lines.push(messages.text(Text::Ready).to_string());
         for step in ready_steps {
-            push_sync_step_lines(&mut lines, step);
+            push_sync_step_lines(&mut lines, step, messages);
         }
         lines.push(String::new());
     }
 
     if !plan.graph.blocked.is_empty() {
-        lines.push("Blocked".to_string());
+        lines.push(messages.text(Text::Blocked).to_string());
         for blocked in &plan.graph.blocked {
             if let Some(step) = plan.steps.iter().find(|step| step.id == blocked.id) {
-                push_sync_step_lines(&mut lines, step);
+                push_sync_step_lines(&mut lines, step, messages);
             }
         }
         lines.push(String::new());
@@ -1996,135 +3041,171 @@ fn sync_plan_output(plan: SyncPlan) -> ActionOutput {
         .filter(|step| matches!(step.kind, SyncStepKind::Verify))
         .collect::<Vec<_>>();
     if !verify_steps.is_empty() {
-        lines.push("Verify".to_string());
+        lines.push(messages.text(Text::Verify).to_string());
         for step in verify_steps {
-            push_sync_step_lines(&mut lines, step);
+            push_sync_step_lines(&mut lines, step, messages);
         }
     }
 
-    ActionOutput::ok("Preview sync", lines)
+    ActionOutput::ok(messages.text(Text::PreviewSync), lines)
 }
 
-fn push_sync_step_lines(lines: &mut Vec<String>, step: &crate::sync::SyncStep) {
+fn push_sync_step_lines(lines: &mut Vec<String>, step: &crate::sync::SyncStep, messages: Messages) {
     lines.push(format!(
         "- [{}] {} - {}",
-        kind_label(&step.kind),
+        kind_label(&step.kind, messages),
         step.target,
         step.reason
     ));
     if !step.blocked_by.is_empty() {
-        lines.push(format!("   blocked by: {}", step.blocked_by.join(", ")));
+        lines.push(format!(
+            "   {}: {}",
+            messages.text(Text::BlockedBy),
+            step.blocked_by.join(", ")
+        ));
     }
     if let Some(command) = &step.command {
         let label = if step.manual {
-            "instruction"
+            messages.text(Text::Instruction)
         } else {
-            "command"
+            messages.text(Text::Command)
         };
         lines.push(format!("   {label}: {command}"));
     }
     if let Some(file) = &step.file {
-        lines.push(format!("   file: {}", file.display()));
+        lines.push(format!(
+            "   {}: {}",
+            messages.text(Text::File),
+            file.display()
+        ));
     }
     if let Some(snippet) = &step.snippet {
         lines.push(format!(
-            "   snippet: {}",
+            "   {}: {}",
+            messages.text(Text::Snippet),
             snippet.replace('\n', "\n            ")
         ));
     }
     if step.requires_sudo {
-        lines.push("   requires sudo: yes".to_string());
+        lines.push(format!("   {}", messages.text(Text::RequiresSudoYes)));
     }
 }
 
-fn sync_execution_output(execution: SyncExecution) -> ActionOutput {
-    let mut lines = vec!["Sync execution".to_string()];
+fn sync_execution_output(execution: SyncExecution, messages: Messages) -> ActionOutput {
+    let mut lines = vec![messages.text(Text::SyncExecution).to_string()];
     if let Some(channel) = &execution.policy_channel {
-        lines.push(format!("Target channel: {channel}"));
+        lines.push(format!("{}: {channel}", messages.text(Text::TargetChannel)));
     }
     if let Some(platform) = &execution.platform {
-        lines.push(format!("Target platform: {platform}"));
+        lines.push(format!(
+            "{}: {platform}",
+            messages.text(Text::TargetPlatform)
+        ));
     }
     if execution.auto_fix {
-        lines.push("Policy auto-fix: enabled".to_string());
+        lines.push(messages.text(Text::PolicyAutoFixEnabled).to_string());
     }
     lines.push(String::new());
 
     for step in &execution.steps {
         lines.push(format!(
             "- [{}] {}: {}",
-            execution_status_label(&step.status),
+            execution_status_label(&step.status, messages),
             step.target,
             step.detail
         ));
         if !step.blocked_by.is_empty() {
-            lines.push(format!("  blocked by: {}", step.blocked_by.join(", ")));
+            lines.push(format!(
+                "  {}: {}",
+                messages.text(Text::BlockedBy),
+                step.blocked_by.join(", ")
+            ));
         }
         if let Some(command) = &step.command {
             let label = if step.manual {
-                "instruction"
+                messages.text(Text::Instruction)
             } else {
-                "command"
+                messages.text(Text::Command)
             };
             lines.push(format!("  {label}: {command}"));
         }
         if let Some(file) = &step.file {
-            lines.push(format!("  file: {}", file.display()));
+            lines.push(format!(
+                "  {}: {}",
+                messages.text(Text::File),
+                file.display()
+            ));
         }
     }
 
     lines.push(String::new());
     if execution.succeeded {
-        lines.push("Result: environment matches policy".to_string());
+        lines.push(format!(
+            "{}: {}",
+            messages.text(Text::Result),
+            messages.text(Text::ResultEnvironmentMatchesPolicy)
+        ));
     } else {
-        lines.push("Result: sync stopped before reaching the configured policy".to_string());
+        lines.push(format!(
+            "{}: {}",
+            messages.text(Text::Result),
+            messages.text(Text::ResultSyncStopped)
+        ));
     }
 
     ActionOutput {
-        title: "Apply sync".to_string(),
+        title: messages.text(Text::ApplySync).to_string(),
         lines,
         ok: execution.succeeded,
         mark_saved: false,
     }
 }
 
-fn status_label(status: &Status) -> &'static str {
+fn status_label(status: &Status, messages: Messages) -> &'static str {
     match status {
-        Status::Ok => "ok",
-        Status::Missing => "missing",
-        Status::Mismatch => "mismatch",
-        Status::Unknown => "unknown",
+        Status::Ok => messages.label(Label::Ok),
+        Status::Missing => messages.label(Label::Missing),
+        Status::Mismatch => messages.label(Label::Mismatch),
+        Status::Unknown => messages.label(Label::Unknown),
     }
 }
 
-fn kind_label(kind: &SyncStepKind) -> &'static str {
+fn issue_severity_label(severity: IssueSeverity, messages: Messages) -> &'static str {
+    match severity {
+        IssueSeverity::Error => messages.label(Label::Error),
+        IssueSeverity::Warning => messages.label(Label::Warning),
+        IssueSeverity::Info => messages.label(Label::Info),
+    }
+}
+
+fn kind_label(kind: &SyncStepKind, messages: Messages) -> &'static str {
     match kind {
-        SyncStepKind::Install => "install",
-        SyncStepKind::Align => "align",
-        SyncStepKind::Configure => "configure",
-        SyncStepKind::Cleanup => "cleanup",
-        SyncStepKind::Verify => "verify",
-        SyncStepKind::Info => "info",
+        SyncStepKind::Install => messages.label(Label::Install),
+        SyncStepKind::Align => messages.label(Label::Align),
+        SyncStepKind::Configure => messages.label(Label::Configure),
+        SyncStepKind::Cleanup => messages.label(Label::Cleanup),
+        SyncStepKind::Verify => messages.label(Label::Verify),
+        SyncStepKind::Info => messages.label(Label::Info),
     }
 }
 
-fn execution_status_label(status: &SyncStepExecutionStatus) -> &'static str {
+fn execution_status_label(status: &SyncStepExecutionStatus, messages: Messages) -> &'static str {
     match status {
-        SyncStepExecutionStatus::Applied => "applied",
-        SyncStepExecutionStatus::Unchanged => "unchanged",
-        SyncStepExecutionStatus::Skipped => "skipped",
-        SyncStepExecutionStatus::Failed => "failed",
-        SyncStepExecutionStatus::Verified => "verified",
+        SyncStepExecutionStatus::Applied => messages.label(Label::Applied),
+        SyncStepExecutionStatus::Unchanged => messages.label(Label::Unchanged),
+        SyncStepExecutionStatus::Skipped => messages.label(Label::Skipped),
+        SyncStepExecutionStatus::Failed => messages.label(Label::Failed),
+        SyncStepExecutionStatus::Verified => messages.label(Label::Verified),
     }
 }
 
-fn tool_field_rows(draft: &InitDraft, tool: &'static str) -> Vec<FieldRow> {
+fn tool_field_rows(draft: &InitDraft, tool: &'static str, messages: Messages) -> Vec<FieldRow> {
     let mut rows = vec![FieldRow {
-        label: "enabled".to_string(),
+        label: messages.label(Label::Enabled).to_string(),
         value: if tool_enabled(draft, tool) {
-            "yes".to_string()
+            messages.label(Label::Enabled).to_string()
         } else {
-            "no".to_string()
+            messages.label(Label::Disabled).to_string()
         },
         target: FieldTarget::ToolEnabled(tool),
     }];
@@ -2136,17 +3217,17 @@ fn tool_field_rows(draft: &InitDraft, tool: &'static str) -> Vec<FieldRow> {
         "node" => {
             if let Some(node) = &draft.node {
                 rows.push(FieldRow {
-                    label: "version".to_string(),
+                    label: tui_text(messages, TuiText::Version).to_string(),
                     value: node.version.clone(),
                     target: FieldTarget::NodeVersion,
                 });
                 rows.push(FieldRow {
-                    label: "manager".to_string(),
+                    label: messages.text(Text::Manager).to_string(),
                     value: node.manager.clone(),
                     target: FieldTarget::NodeManager,
                 });
                 rows.push(FieldRow {
-                    label: "package managers".to_string(),
+                    label: tui_text(messages, TuiText::NodePackageManagers).to_string(),
                     value: list_value(Some(&node.package_managers)),
                     target: FieldTarget::NodePackageManagers,
                 });
@@ -2155,17 +3236,17 @@ fn tool_field_rows(draft: &InitDraft, tool: &'static str) -> Vec<FieldRow> {
         "go" => {
             if let Some(go) = &draft.go {
                 rows.push(FieldRow {
-                    label: "version".to_string(),
+                    label: tui_text(messages, TuiText::Version).to_string(),
                     value: go.version.clone(),
                     target: FieldTarget::GoVersion,
                 });
                 rows.push(FieldRow {
-                    label: "manager".to_string(),
+                    label: messages.text(Text::Manager).to_string(),
                     value: go.manager.clone(),
                     target: FieldTarget::GoManager,
                 });
                 rows.push(FieldRow {
-                    label: "source".to_string(),
+                    label: messages.text(Text::Source).to_string(),
                     value: go.source.clone(),
                     target: FieldTarget::GoSource,
                 });
@@ -2179,7 +3260,7 @@ fn tool_field_rows(draft: &InitDraft, tool: &'static str) -> Vec<FieldRow> {
         "rust" => {
             if let Some(rust) = &draft.rust {
                 rows.push(FieldRow {
-                    label: "channel".to_string(),
+                    label: messages.text(Text::Channel).to_string(),
                     value: rust.channel.clone(),
                     target: FieldTarget::RustChannel,
                 });
@@ -2188,7 +3269,7 @@ fn tool_field_rows(draft: &InitDraft, tool: &'static str) -> Vec<FieldRow> {
         simple => {
             if let Some(tool) = simple_tool(draft, simple) {
                 rows.push(FieldRow {
-                    label: "manager".to_string(),
+                    label: messages.text(Text::Manager).to_string(),
                     value: tool.manager.clone(),
                     target: FieldTarget::SimpleManager(simple),
                 });
@@ -2221,8 +3302,9 @@ fn apply_field_edit(draft: &mut InitDraft, target: &FieldTarget, value: &str) {
         }
         FieldTarget::NodePackageManagers => {
             if let Some(node) = &mut draft.node {
-                node.package_managers = parse_list(value);
+                node.package_managers = normalize_node_package_managers(parse_list(value));
             }
+            sync_node_package_manager_tools(draft);
         }
         FieldTarget::GoVersion => {
             if let Some(go) = &mut draft.go {
@@ -2307,6 +3389,14 @@ fn toggle_tool(draft: &mut InitDraft, tool: &'static str) {
     set_tool_enabled(draft, tool, enabled);
 }
 
+fn normalize_node_package_manager_state(draft: &mut InitDraft) {
+    if let Some(node) = &mut draft.node {
+        node.package_managers =
+            normalize_node_package_managers(std::mem::take(&mut node.package_managers));
+    }
+    sync_node_package_manager_tools(draft);
+}
+
 fn set_tool_enabled(draft: &mut InitDraft, tool: &str, enabled: bool) {
     match tool {
         "fnm" => set_simple_tool(&mut draft.fnm, enabled, default_manager("fnm")),
@@ -2314,14 +3404,15 @@ fn set_tool_enabled(draft: &mut InitDraft, tool: &str, enabled: bool) {
         "node" => {
             if enabled {
                 draft.node.get_or_insert_with(default_node_draft);
+                normalize_node_package_manager_state(draft);
             } else {
                 draft.node = None;
+                sync_node_package_manager_tools(draft);
             }
         }
-        "npm" => set_simple_tool(&mut draft.npm, enabled, "npm"),
-        "pnpm" => set_simple_tool(&mut draft.pnpm, enabled, "corepack"),
-        "yarn" => set_simple_tool(&mut draft.yarn, enabled, "corepack"),
-        "bun" => set_simple_tool(&mut draft.bun, enabled, default_manager("bun")),
+        "npm" | "pnpm" | "yarn" | "bun" => {
+            set_node_package_manager_tool_enabled(draft, tool, enabled);
+        }
         "deno" => set_simple_tool(&mut draft.deno, enabled, default_manager("deno")),
         "go" => {
             if enabled {
@@ -2354,6 +3445,81 @@ fn set_simple_tool(tool: &mut Option<SimpleToolDraft>, enabled: bool, default_ma
     } else {
         *tool = None;
     }
+}
+
+fn set_node_package_manager_tool_enabled(draft: &mut InitDraft, tool: &str, enabled: bool) {
+    match tool {
+        "npm" => set_simple_tool(&mut draft.npm, enabled, "npm"),
+        "pnpm" => set_simple_tool(&mut draft.pnpm, enabled, "corepack"),
+        "yarn" => set_simple_tool(&mut draft.yarn, enabled, "corepack"),
+        "bun" => set_simple_tool(&mut draft.bun, enabled, default_manager("bun")),
+        _ => return,
+    }
+    set_node_package_manager_enabled(draft, tool, enabled);
+}
+
+fn set_node_package_manager_enabled(draft: &mut InitDraft, package_manager: &str, enabled: bool) {
+    if enabled {
+        if draft.node.is_none() {
+            let mut node = default_node_draft();
+            node.package_managers.clear();
+            draft.node = Some(node);
+        }
+        if let Some(node) = &mut draft.node
+            && !node
+                .package_managers
+                .iter()
+                .any(|manager| manager == package_manager)
+        {
+            node.package_managers.push(package_manager.to_string());
+            node.package_managers =
+                normalize_node_package_managers(std::mem::take(&mut node.package_managers));
+        }
+    } else if let Some(node) = &mut draft.node {
+        node.package_managers
+            .retain(|manager| manager != package_manager);
+    }
+}
+
+fn sync_node_package_manager_tools(draft: &mut InitDraft) {
+    let package_managers = draft
+        .node
+        .as_ref()
+        .map(|node| node.package_managers.clone())
+        .unwrap_or_default();
+    for tool in NODE_PACKAGE_MANAGER_TOOLS {
+        let enabled = package_managers.iter().any(|manager| manager == tool);
+        match *tool {
+            "npm" => set_simple_tool(&mut draft.npm, enabled, "npm"),
+            "pnpm" => set_simple_tool(&mut draft.pnpm, enabled, "corepack"),
+            "yarn" => set_simple_tool(&mut draft.yarn, enabled, "corepack"),
+            "bun" => set_simple_tool(&mut draft.bun, enabled, default_manager("bun")),
+            _ => {}
+        }
+    }
+}
+
+fn normalize_node_package_managers(package_managers: Vec<String>) -> Vec<String> {
+    let mut normalized = Vec::new();
+    for known in NODE_PACKAGE_MANAGER_TOOLS {
+        if package_managers
+            .iter()
+            .any(|package_manager| package_manager.eq_ignore_ascii_case(known))
+        {
+            normalized.push((*known).to_string());
+        }
+    }
+    for package_manager in package_managers {
+        if NODE_PACKAGE_MANAGER_TOOLS
+            .iter()
+            .any(|known| package_manager.eq_ignore_ascii_case(known))
+            || normalized.iter().any(|known| known == &package_manager)
+        {
+            continue;
+        }
+        normalized.push(package_manager);
+    }
+    normalized
 }
 
 fn simple_tool<'a>(draft: &'a InitDraft, tool: &str) -> Option<&'a SimpleToolDraft> {
@@ -2457,7 +3623,7 @@ fn preview_line_count(draft: &InitDraft) -> u16 {
     count.min(u16::MAX as usize) as u16
 }
 
-fn tool_summary(draft: &InitDraft, tool: &str) -> String {
+fn tool_summary(draft: &InitDraft, tool: &str, messages: Messages) -> String {
     match tool {
         "node" => draft
             .node
@@ -2474,20 +3640,30 @@ fn tool_summary(draft: &InitDraft, tool: &str) -> String {
             .as_ref()
             .map(|rust| rust.channel.clone())
             .unwrap_or_default(),
+        "npm" | "pnpm" | "yarn" | "bun" => simple_tool(draft, tool)
+            .map(|tool| match messages.language() {
+                Language::En => format!("node package via {}", tool.manager),
+                Language::Zh => format!("node package via {}", tool.manager),
+            })
+            .unwrap_or_default(),
         simple => simple_tool(draft, simple)
             .map(|tool| format!("via {}", tool.manager))
             .unwrap_or_default(),
     }
 }
 
-fn enabled_label(enabled: bool) -> &'static str {
-    if enabled { "enabled" } else { "disabled" }
+fn enabled_label(enabled: bool, messages: Messages) -> &'static str {
+    if enabled {
+        messages.label(Label::Enabled)
+    } else {
+        messages.label(Label::Disabled)
+    }
 }
 
 fn truthy(value: &str) -> bool {
     matches!(
         value.trim().to_ascii_lowercase().as_str(),
-        "1" | "true" | "yes" | "y" | "on" | "enabled"
+        "1" | "true" | "yes" | "y" | "on" | "enabled" | "已启用"
     )
 }
 
@@ -2532,19 +3708,29 @@ mod tests {
     use std::{
         fs,
         path::PathBuf,
+        sync::mpsc,
         time::{SystemTime, UNIX_EPOCH},
     };
 
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    use ratatui::style::Color;
+    use ratatui::text::Line;
 
-    use crate::init::{InitDraft, PolicyDraft, render_init_document};
+    use crate::doctor::{
+        DoctorReport, Issue, IssueEvidence, IssueKind, IssueSeverity, Status, ToolStatus,
+    };
+    use crate::i18n::{Language, Messages};
+    use crate::init::{
+        CliDraft, InitDraft, NpmDraft, PolicyDraft, SimpleToolDraft, render_init_document,
+    };
     use crate::latest::{VersionCandidate, VersionCandidates};
     use crate::sync::{SyncBlockedStep, SyncPlan, SyncPlanGraph, SyncStep, SyncStepKind};
 
     use super::{
-        ActionOutput, AppExit, FieldTarget, Focus, InitTuiApp, InitTuiOptions, VersionPickerState,
-        action_menu_index, apply_field_edit, default_node_draft, menu_entries, move_index,
-        parse_list, set_tool_enabled, sync_plan_output, tool_enabled,
+        ActionOutput, AppExit, FieldTarget, Focus, InitTuiApp, InitTuiOptions, MenuEntry,
+        VersionPickerState, action_field_rows, action_menu_index, action_output_line_count,
+        apply_field_edit, default_node_draft, doctor_output, field_rows, menu_entries, move_index,
+        parse_list, set_tool_enabled, styled_action_output_line, sync_plan_output, tool_enabled,
     };
 
     #[test]
@@ -2558,7 +3744,20 @@ mod tests {
 
         assert!(tool_enabled(&draft, "node"));
         assert!(tool_enabled(&draft, "nvm"));
+        assert!(tool_enabled(&draft, "npm"));
+        assert!(tool_enabled(&draft, "pnpm"));
+        assert!(tool_enabled(&draft, "yarn"));
+        assert!(tool_enabled(&draft, "bun"));
         assert_eq!(draft.node.as_ref().unwrap().manager, "fnm");
+        assert_eq!(
+            draft.node.as_ref().unwrap().package_managers,
+            vec![
+                "npm".to_string(),
+                "pnpm".to_string(),
+                "yarn".to_string(),
+                "bun".to_string()
+            ]
+        );
         assert_eq!(draft.nvm.as_ref().unwrap().manager, "standalone");
         assert_eq!(draft.bun.as_ref().unwrap().manager, "brew");
         assert_eq!(draft.go.as_ref().unwrap().source, "brew");
@@ -2569,6 +3768,116 @@ mod tests {
 
         set_tool_enabled(&mut draft, "node", false);
         assert!(!tool_enabled(&draft, "node"));
+        assert!(!tool_enabled(&draft, "npm"));
+        assert!(!tool_enabled(&draft, "pnpm"));
+        assert!(!tool_enabled(&draft, "yarn"));
+        assert!(!tool_enabled(&draft, "bun"));
+    }
+
+    #[test]
+    fn node_package_manager_tool_toggles_sync_node_workflow() {
+        let mut draft = empty_draft();
+        draft.node = Some(default_node_draft());
+        set_tool_enabled(&mut draft, "node", true);
+
+        set_tool_enabled(&mut draft, "yarn", false);
+
+        assert!(!tool_enabled(&draft, "yarn"));
+        assert_eq!(
+            draft.node.as_ref().unwrap().package_managers,
+            vec!["npm".to_string(), "pnpm".to_string(), "bun".to_string()]
+        );
+        let document = render_init_document(&draft);
+        assert!(!document.content.contains("[tools.yarn]"));
+        assert!(
+            document
+                .content
+                .contains("package_managers = [\"npm\", \"pnpm\", \"bun\"]")
+        );
+
+        set_tool_enabled(&mut draft, "yarn", true);
+
+        assert!(tool_enabled(&draft, "yarn"));
+        assert_eq!(
+            draft.node.as_ref().unwrap().package_managers,
+            vec![
+                "npm".to_string(),
+                "pnpm".to_string(),
+                "yarn".to_string(),
+                "bun".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn editing_node_package_managers_syncs_tool_toggles() {
+        let mut draft = empty_draft();
+        set_tool_enabled(&mut draft, "node", true);
+
+        apply_field_edit(
+            &mut draft,
+            &FieldTarget::NodePackageManagers,
+            "npm, pnpm, bun",
+        );
+
+        assert!(tool_enabled(&draft, "npm"));
+        assert!(tool_enabled(&draft, "pnpm"));
+        assert!(!tool_enabled(&draft, "yarn"));
+        assert!(tool_enabled(&draft, "bun"));
+
+        apply_field_edit(
+            &mut draft,
+            &FieldTarget::NodePackageManagers,
+            "npm, pnpm, yarn, bun",
+        );
+
+        assert!(tool_enabled(&draft, "yarn"));
+    }
+
+    #[test]
+    fn tui_open_normalizes_node_package_manager_tool_sections() {
+        let mut draft = empty_draft();
+        let mut node = default_node_draft();
+        node.package_managers = vec!["npm".to_string(), "pnpm".to_string(), "bun".to_string()];
+        draft.node = Some(node);
+        draft.yarn = Some(SimpleToolDraft {
+            manager: "corepack".to_string(),
+        });
+
+        let app = InitTuiApp::new(draft);
+
+        assert!(tool_enabled(&app.draft, "npm"));
+        assert!(tool_enabled(&app.draft, "pnpm"));
+        assert!(!tool_enabled(&app.draft, "yarn"));
+        assert!(tool_enabled(&app.draft, "bun"));
+        assert!(app.draft.yarn.is_none());
+        let document = render_init_document(&app.draft);
+        assert!(!document.content.contains("[tools.yarn]"));
+        assert!(
+            document
+                .content
+                .contains("package_managers = [\"npm\", \"pnpm\", \"bun\"]")
+        );
+    }
+
+    #[test]
+    fn tui_open_creates_tool_sections_from_node_package_managers() {
+        let mut draft = empty_draft();
+        let mut node = default_node_draft();
+        node.package_managers = vec!["YARN".to_string()];
+        draft.node = Some(node);
+
+        let app = InitTuiApp::new(draft);
+
+        assert_eq!(
+            app.draft.node.as_ref().unwrap().package_managers,
+            vec!["yarn".to_string()]
+        );
+        assert!(tool_enabled(&app.draft, "yarn"));
+        assert_eq!(app.draft.yarn.as_ref().unwrap().manager, "corepack");
+        let document = render_init_document(&app.draft);
+        assert!(document.content.contains("[tools.yarn]"));
+        assert!(document.content.contains("package_managers = [\"yarn\"]"));
     }
 
     #[test]
@@ -2626,7 +3935,7 @@ mod tests {
             ],
         };
 
-        let output = sync_plan_output(plan);
+        let output = sync_plan_output(plan, Messages::english());
         let text = output.lines.join("\n");
 
         assert!(text.contains("Ready"));
@@ -2671,6 +3980,32 @@ mod tests {
     }
 
     #[test]
+    fn package_sections_use_field_labels_instead_of_repeating_section_titles() {
+        let mut draft = empty_draft();
+        draft.cli = Some(CliDraft {
+            manager: "brew".to_string(),
+            packages: vec!["gh".to_string()],
+        });
+        draft.npm_config = Some(NpmDraft {
+            global_packages: vec!["wrangler".to_string()],
+        });
+        let zh_options = InitTuiOptions {
+            output: PathBuf::from("devkit.toml"),
+            force: false,
+            stdout: false,
+            language: Language::Zh,
+        };
+
+        let homebrew_rows = field_rows(&draft, MenuEntry::Homebrew, &zh_options);
+        let npm_rows = field_rows(&draft, MenuEntry::Npm, &zh_options);
+
+        assert_eq!(homebrew_rows[0].label, "包列表");
+        assert_eq!(homebrew_rows[0].value, "gh");
+        assert_eq!(npm_rows[0].label, "包列表");
+        assert_eq!(npm_rows[0].value, "wrangler");
+    }
+
+    #[test]
     fn parses_comma_lists_and_none() {
         assert_eq!(
             parse_list("npm, pnpm, bun"),
@@ -2706,10 +4041,50 @@ mod tests {
         assert_eq!(app.focus, Focus::Fields);
 
         app.handle_key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE));
+        assert_eq!(app.focus, Focus::SidePanel);
+
+        app.handle_key(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE));
         assert_eq!(app.focus, Focus::Fields);
 
         app.handle_key(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE));
         assert_eq!(app.focus, Focus::Menu);
+    }
+
+    #[test]
+    fn tab_focuses_preview_panel_and_arrows_scroll() {
+        let mut app = InitTuiApp::new(empty_draft());
+        app.focus = Focus::Menu;
+        app.menu_index = 0;
+
+        app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+
+        assert_eq!(app.focus, Focus::SidePanel);
+        assert!(!app.preview_expanded);
+        assert!(!app.action_expanded);
+
+        app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        assert!(app.preview_scroll > 0);
+    }
+
+    #[test]
+    fn tab_focuses_action_output_and_arrows_scroll() {
+        let mut app = InitTuiApp::new(empty_draft());
+        app.menu_index = action_menu_index();
+        app.focus = Focus::Fields;
+        app.action_output = Some(ActionOutput::ok(
+            "Check environment",
+            (0..30).map(|index| format!("line {index}")).collect(),
+        ));
+
+        app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+
+        assert_eq!(app.focus, Focus::SidePanel);
+        assert!(!app.action_expanded);
+        assert!(!app.preview_expanded);
+        assert_eq!(app.menu_index, action_menu_index());
+
+        app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        assert!(app.action_scroll > 0);
     }
 
     #[test]
@@ -2741,6 +4116,9 @@ mod tests {
         ));
 
         app.handle_key(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::NONE));
+        assert_eq!(app.focus, Focus::SidePanel);
+
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
         assert!(app.action_expanded);
         assert!(!app.preview_expanded);
 
@@ -2751,6 +4129,79 @@ mod tests {
         assert!(!app.action_expanded);
         assert_eq!(app.menu_index, action_menu_index());
         assert_eq!(app.field_index, 1);
+    }
+
+    #[test]
+    fn actions_list_excludes_finish_action() {
+        let labels = action_field_rows(&InitTuiOptions {
+            output: PathBuf::from("devkit.toml"),
+            force: false,
+            stdout: false,
+            language: Language::En,
+        })
+        .into_iter()
+        .map(|row| row.label)
+        .collect::<Vec<_>>();
+
+        assert_eq!(
+            labels,
+            vec!["save config", "run check", "preview sync", "apply sync"]
+        );
+    }
+
+    #[test]
+    fn actions_list_uses_selected_language() {
+        let labels = action_field_rows(&InitTuiOptions {
+            output: PathBuf::from("devkit.toml"),
+            force: false,
+            stdout: false,
+            language: Language::Zh,
+        })
+        .into_iter()
+        .map(|row| row.label)
+        .collect::<Vec<_>>();
+
+        assert_eq!(labels, vec!["保存配置", "运行检查", "预览同步", "执行同步"]);
+    }
+
+    #[test]
+    fn language_key_toggles_runtime_tui_language() {
+        let mut app = InitTuiApp::new(empty_draft());
+        app.menu_index = action_menu_index();
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('l'), KeyModifiers::NONE));
+
+        assert_eq!(app.options.language, Language::Zh);
+        assert_eq!(app.status, "已切换为中文");
+        let labels = action_field_rows(&app.options)
+            .into_iter()
+            .map(|row| row.label)
+            .collect::<Vec<_>>();
+        assert_eq!(labels, vec!["保存配置", "运行检查", "预览同步", "执行同步"]);
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('L'), KeyModifiers::NONE));
+
+        assert_eq!(app.options.language, Language::En);
+        assert_eq!(app.status, "Language switched to English");
+    }
+
+    #[test]
+    fn language_key_works_in_preview_but_not_inside_edit_input() {
+        let mut app = InitTuiApp::new(empty_draft());
+        app.open_preview();
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('l'), KeyModifiers::NONE));
+
+        assert_eq!(app.options.language, Language::Zh);
+        assert!(app.preview_expanded);
+
+        app.close_preview();
+        app.focus = Focus::Fields;
+        app.start_edit_or_focus_fields();
+        app.handle_key(KeyEvent::new(KeyCode::Char('l'), KeyModifiers::NONE));
+
+        assert_eq!(app.options.language, Language::Zh);
+        assert!(app.edit.as_ref().unwrap().buffer.ends_with('l'));
     }
 
     #[test]
@@ -2843,6 +4294,122 @@ mod tests {
     }
 
     #[test]
+    fn action_task_updates_visible_progress_before_completion() {
+        let mut app = InitTuiApp::new(empty_draft());
+        let (release_sender, release_receiver) = mpsc::channel();
+
+        app.start_action_task("Test action", move |_draft, _options, progress| {
+            progress.update_detail("Building plan", "checking dependencies");
+            release_receiver.recv().unwrap();
+            Ok(ActionOutput::ok("Done", vec!["finished".to_string()]))
+        });
+
+        wait_until(|| {
+            app.poll_action_task();
+            app.action_task
+                .as_ref()
+                .is_some_and(|task| task.progress.label == "Building plan")
+        });
+
+        let task = app.action_task.as_ref().unwrap();
+        assert_eq!(
+            task.progress.detail.as_deref(),
+            Some("checking dependencies")
+        );
+        assert_eq!(app.status, "Test action: Building plan");
+
+        release_sender.send(()).unwrap();
+        wait_until(|| {
+            app.poll_action_task();
+            app.action_task.is_none()
+        });
+
+        assert_eq!(app.status, "Test action finished");
+        assert!(app.action_output.is_some());
+    }
+
+    #[test]
+    fn doctor_output_formats_path_candidates_as_evidence() {
+        let report = DoctorReport {
+            tools: vec![ToolStatus {
+                name: "python".to_string(),
+                command: "python3".to_string(),
+                path: Some(PathBuf::from("/opt/homebrew/bin/python3")),
+                path_candidates: vec![
+                    PathBuf::from("/opt/homebrew/bin/python3"),
+                    PathBuf::from("/usr/bin/python3"),
+                ],
+                current: Some("3.14.4".to_string()),
+                required: Some("latest".to_string()),
+                manager: Some("brew".to_string()),
+                status: Status::Ok,
+                note: None,
+            }],
+            issues: vec![Issue {
+                kind: IssueKind::PathConflict,
+                severity: IssueSeverity::Warning,
+                path: Some(PathBuf::from("/opt/homebrew/bin/python3")),
+                message: "python resolves to the first of 2 PATH candidates".to_string(),
+                evidence: vec![
+                    IssueEvidence {
+                        key: "active_path".to_string(),
+                        value: "/opt/homebrew/bin/python3".to_string(),
+                    },
+                    IssueEvidence {
+                        key: "candidate_count".to_string(),
+                        value: "2".to_string(),
+                    },
+                    IssueEvidence {
+                        key: "candidates".to_string(),
+                        value: "/opt/homebrew/bin/python3; /usr/bin/python3".to_string(),
+                    },
+                ],
+                fix: Some(
+                    "inspect PATH ordering; candidates: /opt/homebrew/bin/python3; /usr/bin/python3"
+                        .to_string(),
+                ),
+            }],
+        };
+
+        let output = doctor_output(
+            report,
+            &InitTuiOptions {
+                output: PathBuf::from("devkit.toml"),
+                force: false,
+                stdout: true,
+                language: Language::En,
+            },
+        );
+        let text = output.lines.join("\n");
+
+        assert!(text.contains("- python [ok]"));
+        assert!(text.contains("  PATH candidates: 2"));
+        assert!(text.contains("    1. /opt/homebrew/bin/python3 (active)"));
+        assert!(text.contains("  candidates:"));
+        assert!(text.contains("    2. /usr/bin/python3"));
+        assert!(text.contains("  fix: inspect PATH ordering"));
+        assert!(!text.contains("fix: inspect PATH ordering; candidates:"));
+    }
+
+    #[test]
+    fn action_output_lines_style_structured_statuses() {
+        let tool = styled_action_output_line("- python [ok]");
+        assert!(span_has_color(&tool, "ok", Color::Green));
+
+        let issue = styled_action_output_line("- [warning] python resolves to the first candidate");
+        assert!(span_has_color(&issue, "warning", Color::Yellow));
+
+        let fix = styled_action_output_line("  fix: brew install poetry");
+        assert!(span_has_color(&fix, "fix", Color::Green));
+
+        let candidate = styled_action_output_line("    1. /opt/homebrew/bin/python3 (active)");
+        assert!(span_has_color(&candidate, " (active)", Color::Green));
+
+        let lines = vec!["one\ntwo".to_string(), String::new()];
+        assert_eq!(action_output_line_count(&lines), 3);
+    }
+
+    #[test]
     fn finish_action_saves_and_exits_inside_tui() {
         let path = unique_temp_path("devkit-tui-finish");
         let mut app = InitTuiApp::with_options(
@@ -2851,13 +4418,11 @@ mod tests {
                 output: path.clone(),
                 force: false,
                 stdout: false,
+                language: Language::En,
             },
         );
-        app.menu_index = action_menu_index();
-        app.focus = Focus::Fields;
-        app.field_index = 4;
 
-        let exit = app.start_edit_or_focus_fields();
+        let exit = app.handle_key(KeyEvent::new(KeyCode::Char('f'), KeyModifiers::NONE));
 
         assert!(matches!(exit, Some(AppExit::Handled)));
         assert!(fs::read_to_string(&path).unwrap().contains("[policy]"));
@@ -2874,16 +4439,20 @@ mod tests {
                 output: path.clone(),
                 force: false,
                 stdout: true,
+                language: Language::En,
             },
         );
-        app.menu_index = action_menu_index();
-        app.focus = Focus::Fields;
-        app.field_index = 4;
 
-        let exit = app.start_edit_or_focus_fields();
+        let exit = app.handle_key(KeyEvent::new(KeyCode::Char('f'), KeyModifiers::NONE));
 
         assert!(matches!(exit, Some(AppExit::Continue)));
         assert!(!path.exists());
+    }
+
+    fn span_has_color(line: &Line<'_>, content: &str, color: Color) -> bool {
+        line.spans
+            .iter()
+            .any(|span| span.content.as_ref() == content && span.style.fg == Some(color))
     }
 
     fn empty_draft() -> InitDraft {
@@ -2919,5 +4488,16 @@ mod tests {
             .unwrap()
             .as_nanos();
         std::env::temp_dir().join(format!("{prefix}-{timestamp}.toml"))
+    }
+
+    fn wait_until(mut condition: impl FnMut() -> bool) {
+        let started = std::time::Instant::now();
+        while started.elapsed() < std::time::Duration::from_secs(2) {
+            if condition() {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        panic!("condition did not become true before timeout");
     }
 }

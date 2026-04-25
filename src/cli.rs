@@ -2,6 +2,8 @@ use std::path::PathBuf;
 
 use clap::{ArgAction, Parser, Subcommand};
 
+use crate::i18n::Language;
+
 #[derive(Parser, Debug)]
 #[command(name = "devkit")]
 #[command(
@@ -9,14 +11,17 @@ use clap::{ArgAction, Parser, Subcommand};
     about = "Keep personal and team development toolchains healthy"
 )]
 pub struct Cli {
+    /// Output language. Defaults to DEVKIT_LANG or the current locale.
+    #[arg(long, global = true, value_enum)]
+    pub lang: Option<Language>,
+
     #[command(subcommand)]
-    pub command: Option<Commands>,
+    pub command: Commands,
 }
 
 #[derive(Subcommand, Debug)]
 pub enum Commands {
     /// Inspect installed tools, versions, PATH, and common conflicts.
-    #[command(visible_alias = "check")]
     Doctor {
         /// Print machine-readable JSON.
         #[arg(short, long)]
@@ -28,7 +33,6 @@ pub enum Commands {
     },
 
     /// Show upgrade candidates without changing anything.
-    #[command(visible_alias = "up")]
     Upgrade {
         /// Preview actions only. The MVP currently only supports dry-run.
         #[arg(short = 'n', long, default_value_t = true)]
@@ -43,20 +47,34 @@ pub enum Commands {
         config: PathBuf,
 
         /// Skip package-manager and official latest-version queries.
-        #[arg(long, visible_alias = "offline")]
-        skip_latest: bool,
+        #[arg(long)]
+        offline: bool,
     },
 
     /// Generate a starter devkit policy from the current machine state.
-    #[command(visible_alias = "new")]
     Init {
         /// Open a visual TUI editor before generating the config.
         #[arg(short, long)]
         interactive: bool,
 
         /// Print the generated TOML to stdout instead of writing a file.
-        #[arg(short = 'p', long, visible_alias = "print")]
-        stdout: bool,
+        #[arg(short = 'p', long)]
+        print: bool,
+
+        /// Output path for the generated TOML file.
+        #[arg(short, long, default_value = "devkit.toml")]
+        output: PathBuf,
+
+        /// Overwrite an existing output file.
+        #[arg(long)]
+        force: bool,
+    },
+
+    /// Open the visual TUI policy editor.
+    Tui {
+        /// Print the generated TOML to stdout instead of writing a file.
+        #[arg(short = 'p', long)]
+        print: bool,
 
         /// Output path for the generated TOML file.
         #[arg(short, long, default_value = "devkit.toml")]
@@ -68,7 +86,6 @@ pub enum Commands {
     },
 
     /// Install one supported tool directly.
-    #[command(visible_alias = "add")]
     Install {
         /// Tool name, for example bun, node, uv, rust, or go.
         tool: String,
@@ -97,12 +114,12 @@ pub enum Commands {
     /// Plan how to bootstrap or repair a machine to match the configured toolchain.
     Sync {
         /// Preview actions only.
-        #[arg(short = 'n', long, action = ArgAction::SetTrue, conflicts_with = "yes")]
+        #[arg(short = 'n', long, action = ArgAction::SetTrue, conflicts_with = "apply")]
         dry_run: bool,
 
         /// Apply install, align, and managed shell-configuration steps.
-        #[arg(long, visible_alias = "apply", conflicts_with = "dry_run")]
-        yes: bool,
+        #[arg(long, conflicts_with = "dry_run")]
+        apply: bool,
 
         /// Print machine-readable JSON.
         #[arg(short, long)]
@@ -163,16 +180,19 @@ mod tests {
     use super::{Cli, Commands, ConfigCommands};
 
     #[test]
-    fn command_can_be_omitted_for_default_doctor() {
-        let cli = Cli::try_parse_from(["devkit"]).unwrap();
+    fn command_is_required_for_a_single_clear_path() {
+        let error = Cli::try_parse_from(["devkit"]).unwrap_err();
 
-        assert!(cli.command.is_none());
+        assert_eq!(
+            error.kind(),
+            clap::error::ErrorKind::DisplayHelpOnMissingArgumentOrSubcommand
+        );
     }
 
     #[test]
-    fn parses_short_command_aliases() {
-        let cli = Cli::try_parse_from(["devkit", "check", "-j", "-c", "team.toml"]).unwrap();
-        match cli.command.unwrap() {
+    fn parses_canonical_commands() {
+        let cli = Cli::try_parse_from(["devkit", "doctor", "-j", "-c", "team.toml"]).unwrap();
+        match cli.command {
             Commands::Doctor { json, config } => {
                 assert!(json);
                 assert_eq!(config.to_string_lossy(), "team.toml");
@@ -180,22 +200,29 @@ mod tests {
             command => panic!("unexpected command: {command:?}"),
         }
 
-        let cli = Cli::try_parse_from(["devkit", "new", "-i", "-p"]).unwrap();
-        match cli.command.unwrap() {
+        let cli = Cli::try_parse_from(["devkit", "init", "-i", "-p"]).unwrap();
+        match cli.command {
             Commands::Init {
-                interactive,
-                stdout,
-                ..
+                interactive, print, ..
             } => {
                 assert!(interactive);
-                assert!(stdout);
+                assert!(print);
             }
             command => panic!("unexpected command: {command:?}"),
         }
 
-        let cli =
-            Cli::try_parse_from(["devkit", "add", "node", "-n", "-m", "fnm", "-v", "24"]).unwrap();
-        match cli.command.unwrap() {
+        let cli = Cli::try_parse_from(["devkit", "tui", "-p", "-o", "team.toml"]).unwrap();
+        match cli.command {
+            Commands::Tui { print, output, .. } => {
+                assert!(print);
+                assert_eq!(output.to_string_lossy(), "team.toml");
+            }
+            command => panic!("unexpected command: {command:?}"),
+        }
+
+        let cli = Cli::try_parse_from(["devkit", "install", "node", "-n", "-m", "fnm", "-v", "24"])
+            .unwrap();
+        match cli.command {
             Commands::Install {
                 tool,
                 dry_run,
@@ -213,11 +240,32 @@ mod tests {
     }
 
     #[test]
-    fn parses_apply_alias_for_sync_yes() {
+    fn parses_apply_for_sync() {
         let cli = Cli::try_parse_from(["devkit", "sync", "--apply"]).unwrap();
 
-        match cli.command.unwrap() {
-            Commands::Sync { yes, .. } => assert!(yes),
+        match cli.command {
+            Commands::Sync { apply, .. } => assert!(apply),
+            command => panic!("unexpected command: {command:?}"),
+        }
+    }
+
+    #[test]
+    fn rejects_removed_compatibility_commands() {
+        assert!(Cli::try_parse_from(["devkit", "add", "node"]).is_err());
+        assert!(Cli::try_parse_from(["devkit", "check"]).is_err());
+        assert!(Cli::try_parse_from(["devkit", "new"]).is_err());
+        assert!(Cli::try_parse_from(["devkit", "up"]).is_err());
+        assert!(Cli::try_parse_from(["devkit", "sync", "--yes"]).is_err());
+        assert!(Cli::try_parse_from(["devkit", "init", "--stdout"]).is_err());
+        assert!(Cli::try_parse_from(["devkit", "upgrade", "--skip-latest"]).is_err());
+    }
+
+    #[test]
+    fn parses_offline_upgrade() {
+        let cli = Cli::try_parse_from(["devkit", "upgrade", "--offline"]).unwrap();
+
+        match cli.command {
+            Commands::Upgrade { offline, .. } => assert!(offline),
             command => panic!("unexpected command: {command:?}"),
         }
     }
@@ -227,7 +275,7 @@ mod tests {
         let cli =
             Cli::try_parse_from(["devkit", "config", "validate", "-j", "-c", "team.toml"]).unwrap();
 
-        match cli.command.unwrap() {
+        match cli.command {
             Commands::Config {
                 command: ConfigCommands::Validate { json, config },
             } => {
@@ -236,5 +284,12 @@ mod tests {
             }
             command => panic!("unexpected command: {command:?}"),
         }
+    }
+
+    #[test]
+    fn parses_global_language() {
+        let cli = Cli::try_parse_from(["devkit", "--lang", "zh", "doctor"]).unwrap();
+
+        assert_eq!(cli.lang, Some(crate::i18n::Language::Zh));
     }
 }

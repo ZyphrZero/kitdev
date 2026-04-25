@@ -8,6 +8,7 @@ use anyhow::{Context, Result, bail};
 
 use crate::{
     doctor::{DoctorReport, Status, ToolStatus},
+    i18n::Language,
     platform::{OperatingSystem, current_platform_tag, path_contains as platform_path_contains},
     shell::command_path,
 };
@@ -37,6 +38,7 @@ pub struct InitInteractiveOptions {
     pub output: PathBuf,
     pub force: bool,
     pub stdout: bool,
+    pub language: Language,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -184,6 +186,7 @@ pub fn customize_init_draft_interactively_with_options(
                 output: options.output,
                 force: options.force,
                 stdout: options.stdout,
+                language: options.language,
             },
         );
     }
