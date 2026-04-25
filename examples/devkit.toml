@@ -1,11 +1,6 @@
 [policy]
 channel = "stable"
 mirror = "ustc"
-platform = "macos-arm64"
-
-[tools.fnm]
-version = "latest"
-manager = "brew"
 
 [tools.node]
 version = "24.x"
@@ -24,20 +19,6 @@ manager = "corepack"
 version = "stable"
 manager = "corepack"
 
-[tools.bun]
-version = "latest"
-manager = "brew"
-
-[tools.deno]
-version = "latest"
-manager = "brew"
-
-[tools.go]
-version = "1.26.2"
-manager = "official"
-source = "official"
-install_dir = "~/.local/opt/go/current"
-
 [tools.rustc]
 version = "stable"
 manager = "rustup"
@@ -52,27 +33,104 @@ manager = "standalone"
 
 [tools.python]
 version = "latest"
-manager = "brew"
-
-[tools.poetry]
-version = "latest"
-manager = "brew"
-
-[tools.ruby]
-version = "latest"
-manager = "brew"
+manager = "uv"
 
 [tools.wrangler]
 version = "latest"
 manager = "npm"
 
-[tools.cli]
+[npm]
+global_packages = ["wrangler"]
+
+[platform.macos.policy]
+platform = "macos-arm64"
+
+[platform.macos.tools.fnm]
+version = "latest"
+manager = "brew"
+
+[platform.macos.tools.bun]
+version = "latest"
+manager = "brew"
+
+[platform.macos.tools.deno]
+version = "latest"
+manager = "brew"
+
+[platform.macos.tools.go]
+version = "1.26.2"
+manager = "official"
+source = "official"
+install_dir = "~/.local/opt/go/current"
+
+[platform.macos.tools.poetry]
+version = "latest"
+manager = "brew"
+
+[platform.macos.tools.ruby]
+version = "latest"
+manager = "brew"
+
+[platform.macos.tools.cli]
 manager = "brew"
 packages = ["gh", "tmux"]
 
-[homebrew]
+[platform.macos.homebrew]
 mirror = "ustc"
 packages = ["fnm", "bun", "deno", "python", "poetry", "ruby", "gh", "tmux"]
 
-[npm]
-global_packages = ["wrangler"]
+[platform.linux.policy]
+platform = "linux-x86_64"
+
+[platform.linux.tools.fnm]
+version = "latest"
+manager = "standalone"
+
+[platform.linux.tools.bun]
+version = "latest"
+manager = "standalone"
+
+[platform.linux.tools.deno]
+version = "latest"
+manager = "standalone"
+
+[platform.linux.tools.go]
+version = "stable"
+manager = "official"
+source = "official"
+install_dir = "~/.local/opt/go/current"
+
+[platform.linux.tools.poetry]
+version = "latest"
+manager = "official"
+
+[platform.linux.tools.cli]
+packages = ["gh", "tmux"]
+
+[platform.windows.policy]
+platform = "windows-x86_64"
+
+[platform.windows.tools.fnm]
+version = "latest"
+manager = "winget"
+
+[platform.windows.tools.bun]
+version = "latest"
+manager = "winget"
+
+[platform.windows.tools.deno]
+version = "latest"
+manager = "winget"
+
+[platform.windows.tools.go]
+version = "stable"
+manager = "winget"
+source = "winget"
+
+[platform.windows.tools.poetry]
+version = "latest"
+manager = "official"
+
+[platform.windows.tools.cli]
+manager = "winget"
+packages = ["GitHub.cli", "Microsoft.WindowsTerminal"]

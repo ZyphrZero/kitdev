@@ -123,13 +123,44 @@ pub enum Commands {
         #[arg(short, long)]
         json: bool,
     },
+
+    /// Inspect and explain the devkit configuration file.
+    Config {
+        #[command(subcommand)]
+        command: ConfigCommands,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+pub enum ConfigCommands {
+    /// Validate the effective single-file configuration.
+    Validate {
+        /// Print machine-readable JSON.
+        #[arg(short, long)]
+        json: bool,
+
+        /// Read a TOML config file.
+        #[arg(short, long, default_value = "devkit.toml")]
+        config: PathBuf,
+    },
+
+    /// Show which base and platform override values produced this machine's config.
+    Explain {
+        /// Print machine-readable JSON.
+        #[arg(short, long)]
+        json: bool,
+
+        /// Read a TOML config file.
+        #[arg(short, long, default_value = "devkit.toml")]
+        config: PathBuf,
+    },
 }
 
 #[cfg(test)]
 mod tests {
     use clap::Parser;
 
-    use super::{Cli, Commands};
+    use super::{Cli, Commands, ConfigCommands};
 
     #[test]
     fn command_can_be_omitted_for_default_doctor() {
@@ -187,6 +218,22 @@ mod tests {
 
         match cli.command.unwrap() {
             Commands::Sync { yes, .. } => assert!(yes),
+            command => panic!("unexpected command: {command:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_config_subcommands() {
+        let cli =
+            Cli::try_parse_from(["devkit", "config", "validate", "-j", "-c", "team.toml"]).unwrap();
+
+        match cli.command.unwrap() {
+            Commands::Config {
+                command: ConfigCommands::Validate { json, config },
+            } => {
+                assert!(json);
+                assert_eq!(config.to_string_lossy(), "team.toml");
+            }
             command => panic!("unexpected command: {command:?}"),
         }
     }

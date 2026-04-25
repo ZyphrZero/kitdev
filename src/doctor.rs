@@ -3,8 +3,10 @@ use std::path::{Path, PathBuf};
 use serde::Serialize;
 
 use crate::{
-    config::DevkitConfig,
-    shell::{command_path, command_version},
+    config::{DevkitConfig, ToolPolicy},
+    platform::{OperatingSystem, current_platform_tag, home_path, path_contains},
+    shell::{command_path, command_paths, command_version},
+    tool_command::{ToolCommand, command_for_tool_on},
 };
 
 #[derive(Debug, Clone, Serialize)]
@@ -12,6 +14,7 @@ pub struct ToolStatus {
     pub name: String,
     pub command: String,
     pub path: Option<PathBuf>,
+    pub path_candidates: Vec<PathBuf>,
     pub current: Option<String>,
     pub required: Option<String>,
     pub manager: Option<String>,
@@ -37,8 +40,10 @@ pub struct DoctorReport {
 #[derive(Debug, Serialize)]
 pub struct Issue {
     pub kind: IssueKind,
+    pub severity: IssueSeverity,
     pub path: Option<PathBuf>,
     pub message: String,
+    pub evidence: Vec<IssueEvidence>,
     pub fix: Option<String>,
 }
 
@@ -48,6 +53,21 @@ pub enum IssueKind {
     PathConflict,
     LegacyInstall,
     MissingTool,
+    PlatformMismatch,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum IssueSeverity {
+    Error,
+    Warning,
+    Info,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct IssueEvidence {
+    pub key: String,
+    pub value: String,
 }
 
 struct ToolSpec {
@@ -160,16 +180,45 @@ const TOOL_SPECS: &[ToolSpec] = &[
         version_args: &["--version"],
         version_prefix: Some("Homebrew "),
     },
+    ToolSpec {
+        name: "winget",
+        command: "winget",
+        version_args: &["--version"],
+        version_prefix: Some("v"),
+    },
 ];
 
 pub fn build_doctor_report(config: &DevkitConfig) -> DoctorReport {
+    let platform = OperatingSystem::current();
     let tools = TOOL_SPECS
         .iter()
+        .filter(|spec| should_inspect_tool(spec, config, platform))
         .map(|spec| inspect_tool(spec, config))
         .collect::<Vec<_>>();
-    let issues = detect_issues(&tools);
+    let issues = detect_issues(&tools, config, platform);
 
     DoctorReport { tools, issues }
+}
+
+fn should_inspect_tool(spec: &ToolSpec, config: &DevkitConfig, platform: OperatingSystem) -> bool {
+    match spec.name {
+        "brew" => {
+            platform.is_macos()
+                || command_path("brew").is_some()
+                || config_references_manager(config, &["brew", "homebrew"])
+                || config
+                    .homebrew
+                    .as_ref()
+                    .and_then(|homebrew| homebrew.packages.as_ref())
+                    .is_some_and(|packages| !packages.is_empty())
+        }
+        "winget" => {
+            platform.is_windows()
+                || command_path("winget").is_some()
+                || config_references_manager(config, &["winget"])
+        }
+        _ => true,
+    }
 }
 
 fn inspect_tool(spec: &ToolSpec, config: &DevkitConfig) -> ToolStatus {
@@ -177,7 +226,8 @@ fn inspect_tool(spec: &ToolSpec, config: &DevkitConfig) -> ToolStatus {
     let required = policy.and_then(|policy| policy.version.clone());
     let manager = policy.and_then(|policy| policy.manager.clone());
 
-    let path = command_path(spec.command);
+    let path_candidates = command_paths(spec.command);
+    let path = path_candidates.first().cloned();
     let current = path
         .as_ref()
         .and_then(|_| command_version(spec.command, spec.version_args));
@@ -213,6 +263,7 @@ fn inspect_tool(spec: &ToolSpec, config: &DevkitConfig) -> ToolStatus {
         name: spec.name.to_string(),
         command: spec.command.to_string(),
         path,
+        path_candidates,
         current: normalized,
         required,
         manager,
@@ -222,12 +273,10 @@ fn inspect_tool(spec: &ToolSpec, config: &DevkitConfig) -> ToolStatus {
 }
 
 fn manager_matches_path(manager: Option<&str>, path: &Path) -> bool {
-    let path = path.to_string_lossy();
     match manager {
-        Some("brew" | "homebrew") => {
-            path.contains("/opt/homebrew/") || path.contains("/usr/local/")
-        }
-        Some("fnm") => path.contains("fnm"),
+        Some("brew" | "homebrew") => OperatingSystem::current().homebrew_path_matches(path),
+        Some("fnm") => path_contains(path, &["fnm"]),
+        Some("nvm") => path_contains(path, &["/.nvm/", "\\nvm\\", "/nvm/"]),
         _ => true,
     }
 }
@@ -266,137 +315,225 @@ pub fn version_satisfies(current: &str, required: &str) -> bool {
     current == required || current.starts_with(&format!("{required}."))
 }
 
-fn detect_issues(tools: &[ToolStatus]) -> Vec<Issue> {
+fn detect_issues(
+    tools: &[ToolStatus],
+    config: &DevkitConfig,
+    platform: OperatingSystem,
+) -> Vec<Issue> {
     let mut issues = Vec::new();
+
+    if let Some(policy_platform) = config
+        .policy
+        .as_ref()
+        .and_then(|policy| policy.platform.as_deref())
+        && !policy_platform_matches_current(policy_platform, platform)
+    {
+        let current = current_platform_tag();
+        issues.push(Issue {
+            kind: IssueKind::PlatformMismatch,
+            severity: IssueSeverity::Error,
+            path: None,
+            message: format!("policy targets {policy_platform}, but this machine is {current}"),
+            evidence: vec![
+                evidence("policy_platform", policy_platform),
+                evidence("current_platform", &current),
+            ],
+            fix: Some("use a platform-specific config or update [policy].platform".to_string()),
+        });
+    }
 
     for tool in tools {
         if matches!(tool.status, Status::Missing) {
             issues.push(Issue {
                 kind: IssueKind::MissingTool,
+                severity: missing_tool_severity(tool),
                 path: None,
                 message: format!("{} is not available in PATH", tool.name),
-                fix: suggested_install(tool),
+                evidence: missing_tool_evidence(tool),
+                fix: suggested_install(tool, platform),
             });
         }
     }
 
-    if path_exists("/usr/local/go") {
+    if !platform.is_windows() && path_exists("/usr/local/go") {
         issues.push(Issue {
             kind: IssueKind::LegacyInstall,
+            severity: IssueSeverity::Warning,
             path: Some(PathBuf::from("/usr/local/go")),
             message: "legacy official Go install may shadow managed Go versions".to_string(),
+            evidence: vec![evidence("path", "/usr/local/go")],
             fix: Some("sudo rm -rf /usr/local/go".to_string()),
         });
     }
 
-    if path_exists("/usr/local/lib/node_modules") {
+    if !platform.is_windows() && path_exists("/usr/local/lib/node_modules") {
         issues.push(Issue {
             kind: IssueKind::LegacyInstall,
+            severity: IssueSeverity::Warning,
             path: Some(PathBuf::from("/usr/local/lib/node_modules")),
             message: "legacy global Node modules remain under /usr/local".to_string(),
+            evidence: vec![evidence("path", "/usr/local/lib/node_modules")],
             fix: Some("sudo rm -rf /usr/local/lib/node_modules".to_string()),
         });
     }
 
-    if path_exists(home_path(".nvm")) {
+    let nvm_path = if platform.is_windows() {
+        std::env::var_os("APPDATA")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| home_path("AppData/Roaming"))
+            .join("nvm")
+    } else {
+        home_path(".nvm")
+    };
+    if path_exists(&nvm_path) && !config_references_manager(config, &["nvm"]) {
         issues.push(Issue {
             kind: IssueKind::LegacyInstall,
-            path: Some(home_path(".nvm")),
+            severity: IssueSeverity::Warning,
+            path: Some(nvm_path),
             message: "nvm directory exists; verify it is not initialized by your shell".to_string(),
-            fix: Some("remove ~/.nvm after confirming it is unused".to_string()),
+            evidence: vec![evidence(
+                "path",
+                if platform.is_windows() {
+                    "%APPDATA%\\nvm"
+                } else {
+                    "~/.nvm"
+                },
+            )],
+            fix: Some(if platform.is_windows() {
+                "remove the nvm directory after confirming it is unused".to_string()
+            } else {
+                "remove ~/.nvm after confirming it is unused".to_string()
+            }),
         });
     }
 
-    detect_path_conflict(
-        &mut issues,
-        tools,
-        "go",
-        &["/usr/local/go/bin", "/opt/homebrew/bin"],
-    );
-    detect_path_conflict(
-        &mut issues,
-        tools,
-        "node",
-        &["/usr/local/bin", "/Applications/Codex.app"],
-    );
+    detect_path_conflicts(&mut issues, tools);
 
     issues
 }
 
-fn suggested_install(tool: &ToolStatus) -> Option<String> {
-    match (tool.name.as_str(), tool.manager.as_deref()) {
-        ("fnm", _) => Some("brew install fnm".to_string()),
-        ("node", Some("brew" | "homebrew")) => Some("brew install node".to_string()),
-        ("node", _) => Some("fnm install --lts && fnm default lts-latest".to_string()),
-        ("pnpm", _) => {
-            Some("corepack enable && corepack prepare pnpm@latest --activate".to_string())
-        }
-        ("yarn", _) => {
-            Some("corepack enable && corepack prepare yarn@stable --activate".to_string())
-        }
-        ("bun", _) => Some("brew install oven-sh/bun/bun".to_string()),
-        ("deno", Some("standalone")) => {
-            Some("curl -fsSL https://deno.land/install.sh | sh".to_string())
-        }
-        ("deno", _) => Some("brew install deno".to_string()),
-        ("uv", _) => Some("curl -LsSf https://astral.sh/uv/install.sh | sh".to_string()),
-        ("python", Some("uv")) => Some("uv python install".to_string()),
-        ("python", _) => Some("brew install python".to_string()),
-        ("poetry", Some("official")) => {
-            Some("curl -sSL https://install.python-poetry.org | python3 -".to_string())
-        }
-        ("poetry", _) => Some("brew install poetry".to_string()),
-        ("ruby", _) => Some("brew install ruby".to_string()),
-        ("rustup" | "rustc" | "cargo", _) => {
-            Some("curl https://sh.rustup.rs -sSf | sh".to_string())
-        }
-        ("go", _) => Some("install from https://go.dev/dl/ or brew install go".to_string()),
-        ("brew", _) => Some("install Homebrew from https://brew.sh".to_string()),
-        _ => None,
+fn suggested_install(tool: &ToolStatus, platform: OperatingSystem) -> Option<String> {
+    if tool.name == "winget" {
+        return Some(
+            "install App Installer from Microsoft Store or https://aka.ms/getwinget".to_string(),
+        );
+    }
+
+    let command_tool = match tool.name.as_str() {
+        "rustup" | "rustc" | "cargo" => "rust",
+        other => other,
+    };
+    let policy = ToolPolicy {
+        version: tool.required.clone(),
+        manager: tool.manager.clone(),
+        source: tool.manager.clone(),
+        ..ToolPolicy::default()
+    };
+
+    match command_for_tool_on(command_tool, &policy, true, platform).ok()? {
+        ToolCommand::Shell(command) | ToolCommand::Manual(command) => Some(command),
     }
 }
 
-fn detect_path_conflict(
-    issues: &mut Vec<Issue>,
-    tools: &[ToolStatus],
-    tool_name: &str,
-    suspicious: &[&str],
-) {
-    let Some(tool) = tools.iter().find(|tool| tool.name == tool_name) else {
-        return;
-    };
-    let Some(path) = &tool.path else {
-        return;
-    };
-    let path_text = path.to_string_lossy();
+fn missing_tool_severity(tool: &ToolStatus) -> IssueSeverity {
+    if tool.required.is_some() || tool.manager.is_some() {
+        IssueSeverity::Error
+    } else {
+        IssueSeverity::Info
+    }
+}
 
-    if suspicious.iter().any(|segment| path_text.contains(segment)) {
+fn missing_tool_evidence(tool: &ToolStatus) -> Vec<IssueEvidence> {
+    let mut evidence_items = vec![evidence("command", &tool.command)];
+    if let Some(required) = &tool.required {
+        evidence_items.push(evidence("required", required));
+    }
+    if let Some(manager) = &tool.manager {
+        evidence_items.push(evidence("manager", manager));
+    }
+    evidence_items
+}
+
+fn evidence(key: &str, value: &str) -> IssueEvidence {
+    IssueEvidence {
+        key: key.to_string(),
+        value: value.to_string(),
+    }
+}
+
+fn detect_path_conflicts(issues: &mut Vec<Issue>, tools: &[ToolStatus]) {
+    for tool in tools {
+        if tool.path_candidates.len() <= 1 {
+            continue;
+        }
+        let Some(path) = &tool.path else {
+            continue;
+        };
+
         issues.push(Issue {
             kind: IssueKind::PathConflict,
+            severity: IssueSeverity::Warning,
             path: Some(path.clone()),
             message: format!(
-                "{} resolves to a path that may conflict with managed toolchains",
-                tool_name
+                "{} resolves to the first of {} PATH candidates",
+                tool.name,
+                tool.path_candidates.len()
             ),
-            fix: Some("inspect shell PATH ordering and prefer your configured manager".to_string()),
+            evidence: vec![
+                evidence("active_path", &path.display().to_string()),
+                evidence("candidate_count", &tool.path_candidates.len().to_string()),
+                evidence("candidates", &format_path_candidates(&tool.path_candidates)),
+            ],
+            fix: Some(format!(
+                "inspect PATH ordering; candidates: {}",
+                format_path_candidates(&tool.path_candidates)
+            )),
         });
     }
+}
+
+fn format_path_candidates(candidates: &[PathBuf]) -> String {
+    let mut paths = candidates
+        .iter()
+        .take(4)
+        .map(|path| path.display().to_string())
+        .collect::<Vec<_>>();
+    if candidates.len() > paths.len() {
+        paths.push(format!("... and {} more", candidates.len() - paths.len()));
+    }
+    paths.join("; ")
 }
 
 fn path_exists(path: impl AsRef<Path>) -> bool {
     std::fs::symlink_metadata(path).is_ok()
 }
 
-fn home_path(path: impl AsRef<Path>) -> PathBuf {
-    std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("~"))
-        .join(path)
+fn config_references_manager(config: &DevkitConfig, managers: &[&str]) -> bool {
+    config.tools.as_ref().is_some_and(|tools| {
+        tools.values().any(|policy| {
+            [policy.manager.as_deref(), policy.source.as_deref()]
+                .into_iter()
+                .flatten()
+                .any(|manager| managers.contains(&manager))
+        })
+    })
+}
+
+fn policy_platform_matches_current(policy_platform: &str, platform: OperatingSystem) -> bool {
+    OperatingSystem::from_platform_tag(policy_platform)
+        .is_none_or(|policy_os| policy_os == platform)
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{normalize_version, version_satisfies};
+    use std::path::PathBuf;
+
+    use crate::platform::OperatingSystem;
+
+    use super::{
+        IssueKind, IssueSeverity, Status, ToolStatus, detect_path_conflicts, manager_matches_path,
+        normalize_version, suggested_install, version_satisfies,
+    };
 
     #[test]
     fn normalizes_common_version_outputs() {
@@ -424,5 +561,90 @@ mod tests {
         assert!(version_satisfies("1.95.0", "stable"));
         assert!(!version_satisfies("25.9.0", "24.x"));
         assert!(!version_satisfies("1.26.1", "1.26.2"));
+    }
+
+    #[test]
+    fn matches_nvm_managed_node_paths() {
+        assert!(manager_matches_path(
+            Some("nvm"),
+            std::path::Path::new("/Users/dev/.nvm/versions/node/v24.0.0/bin/node")
+        ));
+        assert!(!manager_matches_path(
+            Some("nvm"),
+            std::path::Path::new("/opt/homebrew/bin/node")
+        ));
+    }
+
+    #[test]
+    fn suggests_platform_specific_install_commands() {
+        assert_eq!(
+            suggested_install(
+                &missing_tool("deno", Some("standalone")),
+                OperatingSystem::Linux
+            )
+            .as_deref(),
+            Some("curl -fsSL https://deno.land/install.sh | sh")
+        );
+        assert_eq!(
+            suggested_install(
+                &missing_tool("deno", Some("winget")),
+                OperatingSystem::Windows
+            )
+            .as_deref(),
+            Some("winget install --exact --id DenoLand.Deno")
+        );
+        assert_eq!(
+            suggested_install(&missing_tool("python", None), OperatingSystem::Windows).as_deref(),
+            Some("uv python install")
+        );
+    }
+
+    #[test]
+    fn reports_path_conflict_from_candidate_count() {
+        let tool = ToolStatus {
+            name: "node".to_string(),
+            command: "node".to_string(),
+            path: Some(PathBuf::from("/a/node")),
+            path_candidates: vec![PathBuf::from("/a/node"), PathBuf::from("/b/node")],
+            current: Some("24.0.0".to_string()),
+            required: None,
+            manager: None,
+            status: Status::Ok,
+            note: None,
+        };
+        let mut issues = Vec::new();
+
+        detect_path_conflicts(&mut issues, &[tool]);
+
+        assert_eq!(issues.len(), 1);
+        assert!(matches!(issues[0].kind, IssueKind::PathConflict));
+        assert_eq!(issues[0].severity, IssueSeverity::Warning);
+        assert!(issues[0].message.contains("first of 2 PATH candidates"));
+        assert!(
+            issues[0]
+                .evidence
+                .iter()
+                .any(|evidence| { evidence.key == "active_path" && evidence.value == "/a/node" })
+        );
+        assert!(
+            issues[0]
+                .fix
+                .as_deref()
+                .is_some_and(|fix| fix.contains("/a/node; /b/node"))
+        );
+    }
+
+    fn missing_tool(name: &str, manager: Option<&str>) -> ToolStatus {
+        ToolStatus {
+            name: name.to_string(),
+            command: name.to_string(),
+            path: None,
+            path_candidates: Vec::new(),
+            current: None,
+            required: Some("latest".to_string()),
+            manager: manager.map(ToString::to_string),
+            status: Status::Missing,
+            note: Some("command not found in PATH".to_string()),
+        }
     }
 }

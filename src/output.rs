@@ -3,11 +3,70 @@ use std::path::Path;
 
 use crate::{
     cleanup::CleanupPlan,
-    doctor::{DoctorReport, Status},
+    config::{ConfigExplainReport, ConfigValidationLevel, ConfigValidationReport},
+    doctor::{DoctorReport, IssueSeverity, Status},
     install::{InstallExecution, InstallPlan, InstallStatus},
     sync::{SyncExecution, SyncPlan},
     upgrade::UpgradePlan,
 };
+
+pub fn print_config_validation_report(report: &ConfigValidationReport, json: bool) -> Result<()> {
+    if json {
+        println!("{}", serde_json::to_string_pretty(report)?);
+        return Ok(());
+    }
+
+    if report.items.is_empty() {
+        println!("Config validation: ok");
+        return Ok(());
+    }
+
+    println!(
+        "Config validation: {}",
+        if report.has_errors() {
+            "errors found"
+        } else {
+            "warnings only"
+        }
+    );
+    for item in &report.items {
+        println!(
+            "- {} {}: {}",
+            format_config_validation_level(item.level),
+            item.path,
+            item.message
+        );
+    }
+
+    Ok(())
+}
+
+pub fn print_config_explain_report(report: &ConfigExplainReport, json: bool) -> Result<()> {
+    if json {
+        println!("{}", serde_json::to_string_pretty(report)?);
+        return Ok(());
+    }
+
+    println!("Config explain:");
+    println!("platform: {}", report.platform);
+    if report.applied_overrides.is_empty() {
+        println!("applied overrides: none");
+    } else {
+        println!("applied overrides: {}", report.applied_overrides.join(", "));
+    }
+
+    if report.entries.is_empty() {
+        println!("entries: none");
+        return Ok(());
+    }
+
+    println!("entries:");
+    for entry in &report.entries {
+        println!("- {} = {} ({})", entry.path, entry.value, entry.source);
+    }
+
+    Ok(())
+}
 
 pub fn print_doctor_report(report: &DoctorReport, json: bool) -> Result<()> {
     if json {
@@ -29,15 +88,32 @@ pub fn print_doctor_report(report: &DoctorReport, json: bool) -> Result<()> {
                 .map(|path| path.display().to_string())
                 .unwrap_or_else(|| "-".to_string())
         );
+        if tool.path_candidates.len() > 1 {
+            println!(
+                "           PATH candidates: {}",
+                tool.path_candidates
+                    .iter()
+                    .map(|path| path.display().to_string())
+                    .collect::<Vec<_>>()
+                    .join("; ")
+            );
+        }
     }
 
     if !report.issues.is_empty() {
         println!();
         println!("Issues:");
         for issue in &report.issues {
-            println!("- {}", issue.message);
+            println!(
+                "- [{}] {}",
+                format_issue_severity(issue.severity),
+                issue.message
+            );
             if let Some(path) = &issue.path {
                 println!("  path: {}", path.display());
+            }
+            for evidence in &issue.evidence {
+                println!("  {}: {}", evidence.key, evidence.value);
             }
             if let Some(fix) = &issue.fix {
                 println!("  fix: {fix}");
@@ -149,6 +225,7 @@ pub fn print_install_plan(plan: &InstallPlan, json: bool) -> Result<()> {
             step.target,
             step.reason
         );
+        print_blockers(&step.blocked_by);
         print_step_command(step.command.as_deref(), step.manual);
         if step.requires_sudo {
             println!("  requires sudo: yes");
@@ -173,6 +250,7 @@ pub fn print_install_execution(execution: &InstallExecution, json: bool) -> Resu
             step.target,
             step.detail
         );
+        print_blockers(&step.blocked_by);
         print_step_command(step.command.as_deref(), step.manual);
     }
     print_install_status(&execution.status);
@@ -207,22 +285,38 @@ pub fn print_sync_plan(plan: &SyncPlan, json: bool) -> Result<()> {
     if plan.auto_fix {
         println!("policy auto-fix: enabled");
     }
-    for step in &plan.steps {
-        println!(
-            "- {} {}: {}",
-            format_kind(&step.kind),
-            step.target,
-            step.reason
-        );
-        print_step_command(step.command.as_deref(), step.manual);
-        if let Some(file) = &step.file {
-            println!("  file: {}", file.display());
+
+    let ready_steps = plan
+        .graph
+        .ready
+        .iter()
+        .filter_map(|id| plan.steps.iter().find(|step| step.id == *id))
+        .collect::<Vec<_>>();
+    if !ready_steps.is_empty() {
+        println!("ready:");
+        for step in ready_steps {
+            print_sync_plan_step(step);
         }
-        if let Some(snippet) = &step.snippet {
-            println!("  snippet: {}", snippet.replace('\n', "\n           "));
+    }
+
+    if !plan.graph.blocked.is_empty() {
+        println!("blocked:");
+        for blocked in &plan.graph.blocked {
+            if let Some(step) = plan.steps.iter().find(|step| step.id == blocked.id) {
+                print_sync_plan_step(step);
+            }
         }
-        if step.requires_sudo {
-            println!("  requires sudo: yes");
+    }
+
+    let verify_steps = plan
+        .steps
+        .iter()
+        .filter(|step| matches!(step.kind, crate::sync::SyncStepKind::Verify))
+        .collect::<Vec<_>>();
+    if !verify_steps.is_empty() {
+        println!("verify:");
+        for step in verify_steps {
+            print_sync_plan_step(step);
         }
     }
 
@@ -252,6 +346,7 @@ pub fn print_sync_execution(execution: &SyncExecution, json: bool) -> Result<()>
             step.target,
             step.detail
         );
+        print_blockers(&step.blocked_by);
         print_step_command(step.command.as_deref(), step.manual);
         if let Some(file) = &step.file {
             println!("  file: {}", file.display());
@@ -299,12 +394,53 @@ fn print_step_command(command: Option<&str>, manual: bool) {
     }
 }
 
+fn print_sync_plan_step(step: &crate::sync::SyncStep) {
+    println!(
+        "- {} {}: {}",
+        format_kind(&step.kind),
+        step.target,
+        step.reason
+    );
+    print_blockers(&step.blocked_by);
+    print_step_command(step.command.as_deref(), step.manual);
+    if let Some(file) = &step.file {
+        println!("  file: {}", file.display());
+    }
+    if let Some(snippet) = &step.snippet {
+        println!("  snippet: {}", snippet.replace('\n', "\n           "));
+    }
+    if step.requires_sudo {
+        println!("  requires sudo: yes");
+    }
+}
+
+fn print_blockers(blocked_by: &[String]) {
+    if !blocked_by.is_empty() {
+        println!("  blocked by: {}", blocked_by.join(", "));
+    }
+}
+
 fn format_status(status: &Status) -> &'static str {
     match status {
         Status::Ok => "ok",
         Status::Missing => "missing",
         Status::Mismatch => "mismatch",
         Status::Unknown => "unknown",
+    }
+}
+
+fn format_config_validation_level(level: ConfigValidationLevel) -> &'static str {
+    match level {
+        ConfigValidationLevel::Error => "error",
+        ConfigValidationLevel::Warning => "warning",
+    }
+}
+
+fn format_issue_severity(severity: IssueSeverity) -> &'static str {
+    match severity {
+        IssueSeverity::Error => "error",
+        IssueSeverity::Warning => "warning",
+        IssueSeverity::Info => "info",
     }
 }
 

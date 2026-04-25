@@ -7,6 +7,8 @@ mod init_tui;
 mod install;
 mod latest;
 mod output;
+mod package_manager;
+mod platform;
 mod shell;
 mod sync;
 mod tool_command;
@@ -18,18 +20,19 @@ use std::path::PathBuf;
 
 use crate::{
     cleanup::build_cleanup_plan,
-    cli::{Cli, Commands},
+    cli::{Cli, Commands, ConfigCommands},
     config::DevkitConfig,
     doctor::build_doctor_report,
     init::{
-        build_init_draft, customize_init_draft_interactively, render_init_document,
-        write_init_document,
+        InitInteractionOutcome, InitInteractiveOptions, build_init_draft,
+        customize_init_draft_interactively_with_options, render_init_document, write_init_document,
     },
     install::{build_install_plan, execute_install_plan},
     output::{
-        print_cleanup_plan, print_doctor_report, print_init_cancelled, print_init_document,
-        print_init_result, print_install_execution, print_install_plan, print_sync_execution,
-        print_sync_plan, print_upgrade_plan,
+        print_cleanup_plan, print_config_explain_report, print_config_validation_report,
+        print_doctor_report, print_init_cancelled, print_init_document, print_init_result,
+        print_install_execution, print_install_plan, print_sync_execution, print_sync_plan,
+        print_upgrade_plan,
     },
     sync::{build_sync_plan, execute_sync_plan},
     upgrade::build_upgrade_plan,
@@ -67,9 +70,22 @@ fn main() -> Result<()> {
         } => {
             let report = build_doctor_report(&DevkitConfig::default());
             let mut draft = build_init_draft(&report);
-            if interactive && !customize_init_draft_interactively(&mut draft)? {
-                print_init_cancelled()?;
-                return Ok(());
+            if interactive {
+                match customize_init_draft_interactively_with_options(
+                    &mut draft,
+                    InitInteractiveOptions {
+                        output: output.clone(),
+                        force,
+                        stdout,
+                    },
+                )? {
+                    InitInteractionOutcome::Continue => {}
+                    InitInteractionOutcome::Handled => return Ok(()),
+                    InitInteractionOutcome::Cancelled => {
+                        print_init_cancelled()?;
+                        return Ok(());
+                    }
+                }
             }
             let document = render_init_document(&draft);
             if stdout {
@@ -133,6 +149,22 @@ fn main() -> Result<()> {
             let plan = build_cleanup_plan(dry_run);
             print_cleanup_plan(&plan, json)?;
         }
+        Commands::Config { command } => match command {
+            ConfigCommands::Validate { json, config } => {
+                let config = DevkitConfig::read_raw(&config)?;
+                let report = config.validate_for_current_platform();
+                let has_errors = report.has_errors();
+                print_config_validation_report(&report, json)?;
+                if has_errors {
+                    std::process::exit(1);
+                }
+            }
+            ConfigCommands::Explain { json, config } => {
+                let config = DevkitConfig::read_raw(&config)?;
+                let report = config.explain_for_current_platform();
+                print_config_explain_report(&report, json)?;
+            }
+        },
     }
 
     Ok(())

@@ -24,7 +24,74 @@ pub struct VersionCandidate {
     pub note: Option<String>,
 }
 
-pub fn lookup_latest(tool: &str) -> LatestVersion {
+pub fn lookup_latest_for(tool: &str, manager: Option<&str>) -> LatestVersion {
+    let Some(manager) = manager.filter(|manager| !manager.trim().is_empty()) else {
+        return lookup_latest_by_tool(tool);
+    };
+
+    match canonical_manager(manager).as_str() {
+        "brew" => brew_latest(tool),
+        "npm" => match tool {
+            "npm" | "pnpm" | "yarn" | "wrangler" => npm_latest(tool),
+            _ => unsupported_latest(tool, manager, "no npm latest-version provider registered"),
+        },
+        "fnm" if tool == "node" => node_latest(),
+        "nvm" if tool == "node" => node_latest(),
+        "corepack" if matches!(tool, "pnpm" | "yarn") => npm_latest(tool),
+        "standalone" => match tool {
+            "bun" => unsupported_latest(
+                tool,
+                manager,
+                "standalone Bun latest checks are not registered yet",
+            ),
+            "deno" => unsupported_latest(
+                tool,
+                manager,
+                "standalone Deno latest checks are not registered yet",
+            ),
+            "uv" => uv_latest(),
+            "fnm" => unsupported_latest(
+                tool,
+                manager,
+                "standalone fnm latest checks are not registered yet",
+            ),
+            _ => unsupported_latest(
+                tool,
+                manager,
+                "no standalone latest-version provider registered",
+            ),
+        },
+        "official" => match tool {
+            "go" => go_latest(),
+            "poetry" => unsupported_latest(
+                tool,
+                manager,
+                "official Poetry latest checks are not registered yet",
+            ),
+            _ => unsupported_latest(
+                tool,
+                manager,
+                "no official latest-version provider registered",
+            ),
+        },
+        "uv" if tool == "python" => unsupported_latest(
+            tool,
+            manager,
+            "uv-managed Python latest checks are not registered yet",
+        ),
+        "rustup" if matches!(tool, "rust" | "rustup") => rustup_latest(),
+        "rustup" if matches!(tool, "rustc" | "cargo") => rust_toolchain_latest(tool),
+        "winget" | "scoop" | "choco" | "apt" | "apt-get" | "dnf" | "pacman" | "zypper" | "apk"
+        | "manual" => unsupported_latest(
+            tool,
+            manager,
+            "manager-specific latest checks are not registered yet",
+        ),
+        _ => unsupported_latest(tool, manager, "no latest-version provider registered"),
+    }
+}
+
+fn lookup_latest_by_tool(tool: &str) -> LatestVersion {
     match tool {
         "npm" | "pnpm" | "yarn" | "wrangler" => npm_latest(tool),
         "bun" | "deno" | "fnm" | "brew" | "python" | "poetry" | "ruby" => brew_latest(tool),
@@ -47,6 +114,46 @@ pub fn lookup_version_candidates(tool: &str) -> VersionCandidates {
         "go" => go_version_candidates(),
         "rust" | "rustc" | "cargo" => rust_channel_candidates(),
         _ => generic_version_candidates(tool),
+    }
+}
+
+fn unsupported_latest(tool: &str, manager: &str, note: &str) -> LatestVersion {
+    LatestVersion {
+        version: None,
+        source: latest_source_for_manager(manager),
+        note: Some(format!("{note} for `{tool}`")),
+    }
+}
+
+fn latest_source_for_manager(manager: &str) -> &'static str {
+    match canonical_manager(manager).as_str() {
+        "brew" => "homebrew",
+        "npm" => "npm",
+        "fnm" => "fnm remote",
+        "corepack" => "corepack",
+        "standalone" => "standalone",
+        "official" => "official",
+        "uv" => "uv",
+        "rustup" => "rustup",
+        "winget" => "winget",
+        "scoop" => "scoop",
+        "choco" => "choco",
+        "apt" => "apt",
+        "dnf" => "dnf",
+        "pacman" => "pacman",
+        "zypper" => "zypper",
+        "apk" => "apk",
+        "manual" => "manual",
+        _ => "unsupported",
+    }
+}
+
+fn canonical_manager(manager: &str) -> String {
+    match manager.trim().to_ascii_lowercase().as_str() {
+        "homebrew" => "brew".to_string(),
+        "apt-get" => "apt".to_string(),
+        "chocolatey" => "choco".to_string(),
+        other => other.to_string(),
     }
 }
 
@@ -386,8 +493,8 @@ fn rust_toolchain_latest(tool: &str) -> LatestVersion {
 mod tests {
     use super::{
         VersionCandidate, dedupe_candidates, extend_major_candidates, extend_minor_candidates,
-        normalize_candidate_version, parse_go_release_json, parse_node_release_json,
-        sort_versions_desc,
+        lookup_latest_for, normalize_candidate_version, parse_go_release_json,
+        parse_node_release_json, sort_versions_desc,
     };
 
     #[test]
@@ -465,5 +572,27 @@ mod tests {
             ]),
             vec!["25.0.0", "24.11.0", "24.2.0"]
         );
+    }
+
+    #[test]
+    fn manager_specific_latest_avoids_wrong_provider() {
+        let latest = lookup_latest_for("deno", Some("winget"));
+
+        assert_eq!(latest.version, None);
+        assert_eq!(latest.source, "winget");
+        assert!(
+            latest
+                .note
+                .as_deref()
+                .is_some_and(|note| note.contains("manager-specific"))
+        );
+    }
+
+    #[test]
+    fn default_latest_reports_unsupported_tools_without_external_commands() {
+        let latest = lookup_latest_for("devkit-test-unsupported", None);
+
+        assert_eq!(latest.version, None);
+        assert_eq!(latest.source, "unsupported");
     }
 }

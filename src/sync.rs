@@ -11,8 +11,13 @@ use serde::Serialize;
 use crate::{
     config::{DevkitConfig, ToolPolicy},
     doctor::{DoctorReport, Issue, IssueKind, Status, ToolStatus, build_doctor_report},
+    package_manager::detected_cli_manager,
+    platform::{OperatingSystem, home_path, path_contains},
     shell::{command_path, run_shell_command},
-    tool_command::{ToolCommand, command_for_tool, homebrew_install_command},
+    tool_command::{
+        ToolCommand, command_for_package, command_for_tool, homebrew_install_command,
+        rustup_install_command,
+    },
 };
 
 #[derive(Debug, Clone, Copy, Serialize)]
@@ -32,7 +37,21 @@ pub struct SyncPlan {
     pub policy_channel: Option<String>,
     pub platform: Option<String>,
     pub auto_fix: bool,
+    pub graph: SyncPlanGraph,
     pub steps: Vec<SyncStep>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct SyncPlanGraph {
+    pub ready: Vec<String>,
+    pub blocked: Vec<SyncBlockedStep>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct SyncBlockedStep {
+    pub id: String,
+    pub target: String,
+    pub blocked_by: Vec<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -41,6 +60,7 @@ pub struct SyncStep {
     pub kind: SyncStepKind,
     pub target: String,
     pub reason: String,
+    pub blocked_by: Vec<String>,
     pub command: Option<String>,
     pub file: Option<PathBuf>,
     pub snippet: Option<String>,
@@ -67,6 +87,7 @@ pub struct SyncStepExecution {
     pub target: String,
     pub status: SyncStepExecutionStatus,
     pub detail: String,
+    pub blocked_by: Vec<String>,
     pub command: Option<String>,
     pub file: Option<PathBuf>,
     pub manual: bool,
@@ -118,6 +139,7 @@ pub fn build_sync_plan(
                 kind: SyncStepKind::Install,
                 target: "Homebrew".to_string(),
                 reason: "install the package manager used by the configured toolchain".to_string(),
+                blocked_by: Vec::new(),
                 command: Some(homebrew_install_command()),
                 file: None,
                 snippet: None,
@@ -127,8 +149,57 @@ pub fn build_sync_plan(
         );
     }
 
+    if winget_required(config) && is_tool_missing(tools.get("winget").copied()) {
+        push_step(
+            &mut steps,
+            &mut seen,
+            SyncStep {
+                id: "tool:winget".to_string(),
+                kind: SyncStepKind::Install,
+                target: "Windows Package Manager".to_string(),
+                reason: "install the package manager used by the configured toolchain".to_string(),
+                blocked_by: Vec::new(),
+                command: Some(
+                    "install App Installer from Microsoft Store or https://aka.ms/getwinget"
+                        .to_string(),
+                ),
+                file: None,
+                snippet: None,
+                manual: true,
+                requires_sudo: false,
+            },
+        );
+    }
+
     if let Some(step) = rust_sync_step(config, &tools) {
         push_step(&mut steps, &mut seen, step);
+    }
+
+    if uses_nvm(config) && !nvm_installed() {
+        push_step(
+            &mut steps,
+            &mut seen,
+            SyncStep {
+                id: "tool:nvm".to_string(),
+                kind: SyncStepKind::Install,
+                target: "nvm".to_string(),
+                reason: "install nvm required by the configured Node workflow".to_string(),
+                blocked_by: Vec::new(),
+                command: sync_command_for_tool(
+                    "nvm",
+                    &ToolPolicy {
+                        manager: Some("standalone".to_string()),
+                        ..ToolPolicy::default()
+                    },
+                    true,
+                )
+                .and_then(|command| command.into_step_parts().0),
+                file: None,
+                snippet: None,
+                manual: OperatingSystem::current().is_windows(),
+                requires_sudo: false,
+            },
+        );
     }
 
     if let Some(tool_policies) = config.tools.as_ref() {
@@ -207,7 +278,9 @@ pub fn build_sync_plan(
         }
     }
 
-    if let Some(mirror) = homebrew_mirror(config) {
+    if !OperatingSystem::current().is_windows()
+        && let Some(mirror) = homebrew_mirror(config)
+    {
         let brew_missing = is_tool_missing(tools.get("brew").copied());
         let has_brew_packages = config
             .homebrew
@@ -228,6 +301,7 @@ pub fn build_sync_plan(
                     kind: SyncStepKind::Configure,
                     target: "Homebrew mirror".to_string(),
                     reason: format!("configure Homebrew mirror to {}", mirror),
+                    blocked_by: Vec::new(),
                     command: None,
                     file: Some(profile_path),
                     snippet: homebrew_mirror_snippet(&mirror),
@@ -243,6 +317,7 @@ pub fn build_sync_plan(
             || tool_needs_sync(tools.get("node").copied()))
     {
         let shell = current_shell_name();
+        let fnm_missing = is_tool_missing(tools.get("fnm").copied());
         push_step(
             &mut steps,
             &mut seen,
@@ -252,9 +327,39 @@ pub fn build_sync_plan(
                 target: format!("{shell} shell initialization"),
                 reason: "initialize fnm in your shell so managed Node versions are available"
                     .to_string(),
+                blocked_by: if fnm_missing {
+                    vec!["tool:fnm".to_string()]
+                } else {
+                    Vec::new()
+                },
                 command: None,
                 file: Some(shell_rc_path()),
-                snippet: Some(format!("eval \"$(fnm env --use-on-cd --shell {shell})\"")),
+                snippet: Some(fnm_shell_snippet(shell)),
+                manual: false,
+                requires_sudo: false,
+            },
+        );
+    }
+
+    if uses_nvm(config) && (tool_needs_sync(tools.get("node").copied()) || !nvm_installed()) {
+        let shell = current_shell_name();
+        push_step(
+            &mut steps,
+            &mut seen,
+            SyncStep {
+                id: "config:nvm-shell".to_string(),
+                kind: SyncStepKind::Configure,
+                target: format!("{shell} shell initialization"),
+                reason: "initialize nvm in your shell so managed Node versions are available"
+                    .to_string(),
+                blocked_by: if nvm_installed() {
+                    Vec::new()
+                } else {
+                    vec!["tool:nvm".to_string()]
+                },
+                command: None,
+                file: Some(shell_rc_path()),
+                snippet: Some(nvm_shell_snippet(shell)),
                 manual: false,
                 requires_sudo: false,
             },
@@ -264,6 +369,7 @@ pub fn build_sync_plan(
     if let Some(install_dir) = go_install_dir(config)
         && tool_needs_sync(tools.get("go").copied())
     {
+        let go_missing = is_tool_missing(tools.get("go").copied());
         push_step(
             &mut steps,
             &mut seen,
@@ -273,6 +379,11 @@ pub fn build_sync_plan(
                 target: "Go PATH ordering".to_string(),
                 reason: "ensure the configured Go install directory takes precedence in PATH"
                     .to_string(),
+                blocked_by: if go_missing {
+                    vec!["tool:go".to_string()]
+                } else {
+                    Vec::new()
+                },
                 command: None,
                 file: Some(shell_rc_path()),
                 snippet: Some(format!("export PATH=\"{install_dir}/bin:$PATH\"")),
@@ -294,6 +405,7 @@ pub fn build_sync_plan(
             kind: SyncStepKind::Info,
             target: "environment".to_string(),
             reason: "environment already matches the configured bootstrap policy".to_string(),
+            blocked_by: Vec::new(),
             command: None,
             file: None,
             snippet: None,
@@ -307,6 +419,7 @@ pub fn build_sync_plan(
         kind: SyncStepKind::Verify,
         target: "environment".to_string(),
         reason: "re-run doctor after applying the planned steps".to_string(),
+        blocked_by: Vec::new(),
         command: Some(format!("devkit doctor --config {}", config_path.display())),
         file: None,
         snippet: None,
@@ -314,11 +427,14 @@ pub fn build_sync_plan(
         requires_sudo: false,
     });
 
+    let graph = build_sync_graph(&steps);
+
     SyncPlan {
         dry_run,
         policy_channel,
         platform,
         auto_fix,
+        graph,
         steps,
     }
 }
@@ -327,10 +443,49 @@ pub fn execute_sync_plan(plan: &SyncPlan, config: &DevkitConfig) -> SyncExecutio
     let mut results = Vec::new();
     let mut succeeded = true;
     let mut verify_step = None;
+    let ready_ids = plan
+        .graph
+        .ready
+        .iter()
+        .map(String::as_str)
+        .collect::<BTreeSet<_>>();
 
     for step in &plan.steps {
         if matches!(step.kind, SyncStepKind::Verify) {
             verify_step = Some(step);
+            continue;
+        }
+
+        if !ready_ids.contains(step.id.as_str()) {
+            succeeded = false;
+            results.push(SyncStepExecution {
+                id: step.id.clone(),
+                kind: step.kind,
+                target: step.target.clone(),
+                status: SyncStepExecutionStatus::Skipped,
+                detail: format!("blocked by {}", step.blocked_by.join(", ")),
+                blocked_by: step.blocked_by.clone(),
+                command: step.command.clone(),
+                file: step.file.clone(),
+                manual: step.manual,
+            });
+            continue;
+        }
+
+        let unresolved_blockers = unresolved_blockers(step);
+        if !unresolved_blockers.is_empty() {
+            succeeded = false;
+            results.push(SyncStepExecution {
+                id: step.id.clone(),
+                kind: step.kind,
+                target: step.target.clone(),
+                status: SyncStepExecutionStatus::Skipped,
+                detail: format!("blocked by {}", unresolved_blockers.join(", ")),
+                blocked_by: unresolved_blockers,
+                command: step.command.clone(),
+                file: step.file.clone(),
+                manual: step.manual,
+            });
             continue;
         }
 
@@ -341,6 +496,7 @@ pub fn execute_sync_plan(plan: &SyncPlan, config: &DevkitConfig) -> SyncExecutio
                 target: step.target.clone(),
                 status: SyncStepExecutionStatus::Skipped,
                 detail: "manual instruction not applied; review the suggested action".to_string(),
+                blocked_by: step.blocked_by.clone(),
                 command: step.command.clone(),
                 file: step.file.clone(),
                 manual: step.manual,
@@ -355,6 +511,7 @@ pub fn execute_sync_plan(plan: &SyncPlan, config: &DevkitConfig) -> SyncExecutio
                 detail:
                     "cleanup steps remain manual; review `devkit cleanup` before deleting files"
                         .to_string(),
+                blocked_by: step.blocked_by.clone(),
                 command: step.command.clone(),
                 file: step.file.clone(),
                 manual: step.manual,
@@ -365,6 +522,7 @@ pub fn execute_sync_plan(plan: &SyncPlan, config: &DevkitConfig) -> SyncExecutio
                 target: step.target.clone(),
                 status: SyncStepExecutionStatus::Unchanged,
                 detail: step.reason.clone(),
+                blocked_by: step.blocked_by.clone(),
                 command: step.command.clone(),
                 file: step.file.clone(),
                 manual: step.manual,
@@ -382,6 +540,7 @@ pub fn execute_sync_plan(plan: &SyncPlan, config: &DevkitConfig) -> SyncExecutio
                     target: step.target.clone(),
                     status: SyncStepExecutionStatus::Failed,
                     detail: error.to_string(),
+                    blocked_by: step.blocked_by.clone(),
                     command: step.command.clone(),
                     file: step.file.clone(),
                     manual: step.manual,
@@ -433,6 +592,7 @@ fn execute_command_step(step: &SyncStep) -> Result<SyncStepExecution> {
         target: step.target.clone(),
         status: SyncStepExecutionStatus::Applied,
         detail,
+        blocked_by: step.blocked_by.clone(),
         command: step.command.clone(),
         file: step.file.clone(),
         manual: step.manual,
@@ -457,6 +617,7 @@ fn execute_configure_step(step: &SyncStep) -> Result<SyncStepExecution> {
             } else {
                 format!("{} already contains the managed snippet", file.display())
             },
+            blocked_by: step.blocked_by.clone(),
             command: step.command.clone(),
             file: step.file.clone(),
             manual: step.manual,
@@ -471,6 +632,7 @@ fn execute_configure_step(step: &SyncStep) -> Result<SyncStepExecution> {
             status: SyncStepExecutionStatus::Skipped,
             detail: "manual configuration step left in plan; review the suggested command"
                 .to_string(),
+            blocked_by: step.blocked_by.clone(),
             command: step.command.clone(),
             file: step.file.clone(),
             manual: step.manual,
@@ -483,6 +645,7 @@ fn execute_configure_step(step: &SyncStep) -> Result<SyncStepExecution> {
         target: step.target.clone(),
         status: SyncStepExecutionStatus::Unchanged,
         detail: step.reason.clone(),
+        blocked_by: step.blocked_by.clone(),
         command: step.command.clone(),
         file: step.file.clone(),
         manual: step.manual,
@@ -522,6 +685,7 @@ fn build_verify_result(
         target: step.target.clone(),
         status: SyncStepExecutionStatus::Verified,
         detail,
+        blocked_by: step.blocked_by.clone(),
         command: step.command.clone(),
         file: step.file.clone(),
         manual: step.manual,
@@ -562,7 +726,7 @@ fn rust_sync_step(config: &DevkitConfig, tools: &BTreeMap<&str, &ToolStatus>) ->
         .cloned()
         .unwrap_or_default();
     let mut command = if is_tool_missing(rustup) {
-        "curl https://sh.rustup.rs -sSf | sh".to_string()
+        rustup_install_command(OperatingSystem::current())
     } else {
         format!("rustup self update && rustup update {channel}")
     };
@@ -584,6 +748,7 @@ fn rust_sync_step(config: &DevkitConfig, tools: &BTreeMap<&str, &ToolStatus>) ->
         } else {
             format!("align Rust with the configured {channel} toolchain")
         },
+        blocked_by: Vec::new(),
         command: Some(command),
         file: None,
         snippet: None,
@@ -607,6 +772,8 @@ fn tool_sync_step(
     let (command, manual) = sync_command_for_tool(name, policy, install)
         .map(ToolCommand::into_step_parts)
         .unwrap_or((None, false));
+    let blocked_by = tool_dependency_blockers(name, policy, tools);
+    let manual = manual || manager_prerequisite_missing(name, policy, tools);
 
     Some(SyncStep {
         id: format!("tool:{name}"),
@@ -617,6 +784,7 @@ fn tool_sync_step(
         },
         target: name.to_string(),
         reason: tool_sync_reason(tool),
+        blocked_by,
         command,
         file: None,
         snippet: None,
@@ -639,6 +807,7 @@ fn package_manager_step(name: &str, tools: &BTreeMap<&str, &ToolStatus>) -> Opti
         sync_command_for_tool(name, &ToolPolicy::default(), is_tool_missing(tool))
             .map(ToolCommand::into_step_parts)
             .unwrap_or((None, false));
+    let blocked_by = package_manager_dependency_blockers(name, tools);
 
     Some(SyncStep {
         id: format!("tool:{name}"),
@@ -653,6 +822,7 @@ fn package_manager_step(name: &str, tools: &BTreeMap<&str, &ToolStatus>) -> Opti
         } else {
             format!("align {name} with the configured Node workflow")
         },
+        blocked_by,
         command,
         file: None,
         snippet: None,
@@ -666,22 +836,41 @@ fn package_step(package: &str, manager: Option<&str>) -> Option<SyncStep> {
         return None;
     }
 
-    let manager = manager.unwrap_or("brew");
-    let command = match manager {
-        "brew" | "homebrew" => Some(format!("brew install {package}")),
-        "npm" => Some(format!("npm install -g {package}@latest")),
-        _ => Some(format!("{manager} install {package}")),
+    let manager = manager
+        .filter(|manager| !manager.is_empty())
+        .map(ToString::to_string)
+        .or_else(|| detected_cli_manager().map(ToString::to_string))
+        .or_else(|| {
+            OperatingSystem::current()
+                .default_manager_for("cli")
+                .map(ToString::to_string)
+        })
+        .unwrap_or_else(|| "manual".to_string());
+    let (command, manual) = if manager == "manual" {
+        (
+            Some(format!(
+                "choose a platform package manager for CLI package `{package}`"
+            )),
+            true,
+        )
+    } else {
+        command_for_package(package, &manager)
+            .map(ToolCommand::into_step_parts)
+            .unwrap_or_else(|error| (Some(error.to_string()), true))
     };
+    let manual = manual || (manager == "winget" && command_path("winget").is_none());
+    let blocked_by = package_dependency_blockers(&manager);
 
     Some(SyncStep {
         id: format!("package:{manager}:{package}"),
         kind: SyncStepKind::Install,
         target: package.to_string(),
         reason: format!("install CLI package managed by {manager}"),
+        blocked_by,
         command,
         file: None,
         snippet: None,
-        manual: false,
+        manual,
         requires_sudo: false,
     })
 }
@@ -689,6 +878,18 @@ fn package_step(package: &str, manager: Option<&str>) -> Option<SyncStep> {
 fn issue_step(issue: &Issue) -> Option<SyncStep> {
     match issue.kind {
         IssueKind::MissingTool => None,
+        IssueKind::PlatformMismatch => Some(SyncStep {
+            id: "issue:platform-mismatch".to_string(),
+            kind: SyncStepKind::Configure,
+            target: "policy platform".to_string(),
+            reason: issue.message.clone(),
+            blocked_by: Vec::new(),
+            command: issue.fix.clone(),
+            file: None,
+            snippet: None,
+            manual: true,
+            requires_sudo: false,
+        }),
         IssueKind::PathConflict => Some(SyncStep {
             id: format!("issue:path-conflict:{}", issue_id_suffix(issue)),
             kind: SyncStepKind::Configure,
@@ -698,6 +899,7 @@ fn issue_step(issue: &Issue) -> Option<SyncStep> {
                 .map(|path| path.display().to_string())
                 .unwrap_or_else(|| "PATH ordering".to_string()),
             reason: issue.message.clone(),
+            blocked_by: Vec::new(),
             command: issue.fix.clone(),
             file: None,
             snippet: None,
@@ -713,6 +915,7 @@ fn issue_step(issue: &Issue) -> Option<SyncStep> {
                 .map(|path| path.display().to_string())
                 .unwrap_or_else(|| "legacy install".to_string()),
             reason: issue.message.clone(),
+            blocked_by: Vec::new(),
             command: issue.fix.clone(),
             file: issue.path.clone(),
             snippet: None,
@@ -750,24 +953,203 @@ fn manager_path_mismatch(tool: &ToolStatus, policy: &ToolPolicy) -> bool {
     let Some(path) = &tool.path else {
         return false;
     };
-    let path = path.to_string_lossy();
     match manager {
-        "brew" | "homebrew" => !(path.contains("/opt/homebrew/") || path.contains("/usr/local/")),
-        "fnm" => !path.contains("fnm"),
+        "brew" | "homebrew" => !OperatingSystem::current().homebrew_path_matches(path),
+        "fnm" => !path_contains(path, &["fnm"]),
+        "nvm" => !path_contains(path, &["/.nvm/", "\\nvm\\", "/nvm/"]),
         _ => false,
     }
 }
 
+fn manager_prerequisite_missing(
+    tool: &str,
+    policy: &ToolPolicy,
+    tools: &BTreeMap<&str, &ToolStatus>,
+) -> bool {
+    effective_manager_for(tool, policy).is_some_and(|manager| manager == "winget")
+        && is_tool_missing(tools.get("winget").copied())
+}
+
+fn tool_dependency_blockers(
+    tool: &str,
+    policy: &ToolPolicy,
+    tools: &BTreeMap<&str, &ToolStatus>,
+) -> Vec<String> {
+    let mut blockers = Vec::new();
+    let Some(manager) = effective_manager_for(tool, policy) else {
+        return blockers;
+    };
+
+    match manager {
+        "brew" | "homebrew" => push_tool_blocker_if_missing(&mut blockers, "brew", tools),
+        "winget" => push_tool_blocker_if_missing(&mut blockers, "winget", tools),
+        "fnm" if tool == "node" => push_tool_blocker_if_missing(&mut blockers, "fnm", tools),
+        "nvm" if tool == "node" && !nvm_installed() => push_blocker(&mut blockers, "tool:nvm"),
+        "npm" if tool != "npm" => push_tool_blocker_if_missing(&mut blockers, "npm", tools),
+        "corepack" => push_tool_blocker_if_missing(&mut blockers, "node", tools),
+        "uv" if tool == "python" => push_tool_blocker_if_missing(&mut blockers, "uv", tools),
+        "official" if tool == "poetry" && python_missing(tools) => {
+            push_blocker(&mut blockers, "tool:python");
+        }
+        "rustup" if matches!(tool, "rustc" | "cargo") => {
+            push_tool_blocker_if_missing(&mut blockers, "rustup", tools)
+        }
+        _ => {}
+    }
+
+    blockers
+}
+
+fn package_manager_dependency_blockers(
+    package_manager: &str,
+    tools: &BTreeMap<&str, &ToolStatus>,
+) -> Vec<String> {
+    let mut blockers = Vec::new();
+    if matches!(package_manager, "npm" | "pnpm" | "yarn") {
+        push_tool_blocker_if_missing(&mut blockers, "node", tools);
+    }
+    blockers
+}
+
+fn package_dependency_blockers(manager: &str) -> Vec<String> {
+    let mut blockers = Vec::new();
+    match canonical_manager(manager).as_str() {
+        "brew" if command_path("brew").is_none() => push_blocker(&mut blockers, "tool:brew"),
+        "npm" if command_path("npm").is_none() => push_blocker(&mut blockers, "tool:npm"),
+        "winget" if command_path("winget").is_none() => push_blocker(&mut blockers, "tool:winget"),
+        "apt" if command_path("apt-get").is_none() => push_blocker(&mut blockers, "manager:apt"),
+        "dnf" if command_path("dnf").is_none() => push_blocker(&mut blockers, "manager:dnf"),
+        "pacman" if command_path("pacman").is_none() => {
+            push_blocker(&mut blockers, "manager:pacman")
+        }
+        "zypper" if command_path("zypper").is_none() => {
+            push_blocker(&mut blockers, "manager:zypper")
+        }
+        "apk" if command_path("apk").is_none() => push_blocker(&mut blockers, "manager:apk"),
+        "scoop" if command_path("scoop").is_none() => push_blocker(&mut blockers, "manager:scoop"),
+        "choco" if command_path("choco").is_none() => push_blocker(&mut blockers, "manager:choco"),
+        _ => {}
+    }
+    blockers
+}
+
+fn push_tool_blocker_if_missing(
+    blockers: &mut Vec<String>,
+    tool: &str,
+    tools: &BTreeMap<&str, &ToolStatus>,
+) {
+    if dependency_missing(tool, tools) {
+        push_blocker(blockers, &format!("tool:{tool}"));
+    }
+}
+
+fn dependency_missing(tool: &str, tools: &BTreeMap<&str, &ToolStatus>) -> bool {
+    tools
+        .get(tool)
+        .is_none_or(|tool| matches!(tool.status, Status::Missing))
+}
+
+fn python_missing(tools: &BTreeMap<&str, &ToolStatus>) -> bool {
+    dependency_missing("python", tools)
+}
+
+fn push_blocker(blockers: &mut Vec<String>, blocker: &str) {
+    if !blockers.iter().any(|existing| existing == blocker) {
+        blockers.push(blocker.to_string());
+    }
+}
+
+fn unresolved_blockers(step: &SyncStep) -> Vec<String> {
+    step.blocked_by
+        .iter()
+        .filter(|blocker| !blocker_resolved(blocker))
+        .cloned()
+        .collect()
+}
+
+fn blocker_resolved(blocker: &str) -> bool {
+    if let Some(tool) = blocker.strip_prefix("tool:") {
+        return tool_command_visible(tool);
+    }
+    if let Some(manager) = blocker.strip_prefix("manager:") {
+        return manager_command(manager).is_some_and(|command| command_path(command).is_some());
+    }
+    true
+}
+
+fn tool_command_visible(tool: &str) -> bool {
+    match tool {
+        "python" => {
+            command_path("python3").is_some()
+                || command_path("python").is_some()
+                || command_path("py").is_some()
+        }
+        "nvm" => nvm_installed(),
+        "rust" => command_path("rustup").is_some(),
+        "rustc" | "cargo" => command_path(tool).is_some() || command_path("rustup").is_some(),
+        other => command_path(other).is_some(),
+    }
+}
+
+fn manager_command(manager: &str) -> Option<&'static str> {
+    match canonical_manager(manager).as_str() {
+        "brew" => Some("brew"),
+        "nvm" => Some("nvm"),
+        "npm" => Some("npm"),
+        "winget" => Some("winget"),
+        "apt" => Some("apt-get"),
+        "dnf" => Some("dnf"),
+        "pacman" => Some("pacman"),
+        "zypper" => Some("zypper"),
+        "apk" => Some("apk"),
+        "scoop" => Some("scoop"),
+        "choco" => Some("choco"),
+        _ => None,
+    }
+}
+
+fn canonical_manager(manager: &str) -> String {
+    match manager {
+        "homebrew" => "brew".to_string(),
+        "apt-get" => "apt".to_string(),
+        "chocolatey" => "choco".to_string(),
+        other => other.to_string(),
+    }
+}
+
+fn effective_manager_for<'a>(tool: &str, policy: &'a ToolPolicy) -> Option<&'a str> {
+    policy
+        .manager
+        .as_deref()
+        .filter(|manager| !manager.is_empty())
+        .or_else(|| policy.source.as_deref().filter(|source| !source.is_empty()))
+        .or_else(|| OperatingSystem::current().default_manager_for(tool))
+}
+
 fn brew_required(config: &DevkitConfig) -> bool {
     config.tools.as_ref().is_some_and(|tools| {
-        tools
-            .values()
-            .any(|policy| matches!(policy.manager.as_deref(), Some("brew") | Some("homebrew")))
+        tools.values().any(|policy| {
+            matches!(
+                policy.manager.as_deref().or(policy.source.as_deref()),
+                Some("brew") | Some("homebrew")
+            )
+        })
     }) || config
         .homebrew
         .as_ref()
         .and_then(|homebrew| homebrew.packages.as_ref())
         .is_some_and(|packages| !packages.is_empty())
+}
+
+fn winget_required(config: &DevkitConfig) -> bool {
+    config.tools.as_ref().is_some_and(|tools| {
+        tools.values().any(|policy| {
+            matches!(
+                policy.manager.as_deref().or(policy.source.as_deref()),
+                Some("winget")
+            )
+        })
+    })
 }
 
 fn uses_fnm(config: &DevkitConfig) -> bool {
@@ -777,6 +1159,16 @@ fn uses_fnm(config: &DevkitConfig) -> bool {
                 .get("node")
                 .and_then(|policy| policy.manager.as_deref())
                 .is_some_and(|manager| manager == "fnm")
+    })
+}
+
+fn uses_nvm(config: &DevkitConfig) -> bool {
+    config.tools.as_ref().is_some_and(|tools| {
+        tools.contains_key("nvm")
+            || tools
+                .get("node")
+                .and_then(|policy| policy.manager.as_deref())
+                .is_some_and(|manager| manager == "nvm")
     })
 }
 
@@ -811,37 +1203,40 @@ fn go_install_dir(config: &DevkitConfig) -> Option<String> {
 }
 
 fn current_shell_name() -> &'static str {
-    if std::env::var("SHELL")
-        .unwrap_or_default()
-        .ends_with("/bash")
-    {
-        "bash"
-    } else {
-        "zsh"
+    OperatingSystem::current().fnm_shell_name()
+}
+
+fn fnm_shell_snippet(shell: &str) -> String {
+    match shell {
+        "powershell" => {
+            "fnm env --use-on-cd --shell powershell | Out-String | Invoke-Expression".to_string()
+        }
+        "fish" => "fnm env --use-on-cd --shell fish | source".to_string(),
+        _ => format!("eval \"$(fnm env --use-on-cd --shell {shell})\""),
+    }
+}
+
+fn nvm_shell_snippet(shell: &str) -> String {
+    match shell {
+        "powershell" => {
+            "# nvm-windows does not need shell initialization; restart PowerShell after installation"
+                .to_string()
+        }
+        "fish" => {
+            "set -gx NVM_DIR \"$HOME/.nvm\"\n[ -s \"$NVM_DIR/nvm.sh\" ]; and bass source \"$NVM_DIR/nvm.sh\"".to_string()
+        }
+        _ => {
+            "export NVM_DIR=\"$HOME/.nvm\"\n[ -s \"$NVM_DIR/nvm.sh\" ] && \\. \"$NVM_DIR/nvm.sh\"\n[ -s \"$NVM_DIR/bash_completion\" ] && \\. \"$NVM_DIR/bash_completion\"".to_string()
+        }
     }
 }
 
 fn shell_rc_path() -> PathBuf {
-    home_path(if current_shell_name() == "bash" {
-        ".bashrc"
-    } else {
-        ".zshrc"
-    })
+    OperatingSystem::current().shell_rc_path()
 }
 
 fn shell_profile_path() -> PathBuf {
-    home_path(if current_shell_name() == "bash" {
-        ".bash_profile"
-    } else {
-        ".zprofile"
-    })
-}
-
-fn home_path(path: &str) -> PathBuf {
-    std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("~"))
-        .join(path)
+    OperatingSystem::current().shell_profile_path()
 }
 
 fn is_rust_policy(name: &str) -> bool {
@@ -856,10 +1251,44 @@ fn is_tool_missing(tool: Option<&ToolStatus>) -> bool {
     tool.is_none_or(|tool| matches!(tool.status, Status::Missing))
 }
 
+fn nvm_installed() -> bool {
+    if command_path("nvm").is_some() {
+        return true;
+    }
+
+    let nvm_dir = std::env::var_os("NVM_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| home_path(".nvm"));
+    nvm_dir.join("nvm.sh").is_file()
+}
+
 fn push_step(steps: &mut Vec<SyncStep>, seen: &mut BTreeSet<String>, step: SyncStep) {
     if seen.insert(step.id.clone()) {
         steps.push(step);
     }
+}
+
+fn build_sync_graph(steps: &[SyncStep]) -> SyncPlanGraph {
+    let mut ready = Vec::new();
+    let mut blocked = Vec::new();
+
+    for step in steps {
+        if matches!(step.kind, SyncStepKind::Verify) {
+            continue;
+        }
+
+        if step.blocked_by.is_empty() {
+            ready.push(step.id.clone());
+        } else {
+            blocked.push(SyncBlockedStep {
+                id: step.id.clone(),
+                target: step.target.clone(),
+                blocked_by: step.blocked_by.clone(),
+            });
+        }
+    }
+
+    SyncPlanGraph { ready, blocked }
 }
 
 fn issue_id_suffix(issue: &Issue) -> String {
@@ -1085,6 +1514,7 @@ mod tests {
             npm: Some(NpmConfig {
                 global_packages: None,
             }),
+            ..DevkitConfig::default()
         };
         let report = DoctorReport {
             tools: vec![
@@ -1111,6 +1541,30 @@ mod tests {
         assert!(ids.contains(&"tool:uv"));
         assert!(ids.contains(&"config:fnm-shell"));
         assert!(ids.contains(&"verify:doctor"));
+        assert!(
+            plan.steps
+                .iter()
+                .find(|step| step.id == "tool:pnpm")
+                .is_some_and(|step| step.blocked_by == vec!["tool:node"])
+        );
+        assert_eq!(plan.graph.ready, vec!["tool:brew", "tool:uv"]);
+        assert!(
+            plan.graph
+                .blocked
+                .iter()
+                .any(|step| { step.id == "tool:fnm" && step.blocked_by == vec!["tool:brew"] })
+        );
+        assert!(
+            plan.graph
+                .blocked
+                .iter()
+                .any(|step| { step.id == "tool:node" && step.blocked_by == vec!["tool:fnm"] })
+        );
+        assert!(
+            plan.graph.blocked.iter().any(|step| {
+                step.id == "config:fnm-shell" && step.blocked_by == vec!["tool:fnm"]
+            })
+        );
     }
 
     #[test]
@@ -1141,6 +1595,7 @@ mod tests {
             ),
             homebrew: None,
             npm: None,
+            ..DevkitConfig::default()
         };
         let report = DoctorReport {
             tools: vec![
@@ -1148,6 +1603,7 @@ mod tests {
                     name: "rustup".to_string(),
                     command: "rustup".to_string(),
                     path: Some(PathBuf::from("/tmp/rustup")),
+                    path_candidates: vec![PathBuf::from("/tmp/rustup")],
                     current: Some("1.29.0".to_string()),
                     required: None,
                     manager: None,
@@ -1158,6 +1614,7 @@ mod tests {
                     name: "rustc".to_string(),
                     command: "rustc".to_string(),
                     path: Some(PathBuf::from("/tmp/rustc")),
+                    path_candidates: vec![PathBuf::from("/tmp/rustc")],
                     current: Some("1.94.0".to_string()),
                     required: Some("stable".to_string()),
                     manager: Some("rustup".to_string()),
@@ -1168,6 +1625,7 @@ mod tests {
                     name: "cargo".to_string(),
                     command: "cargo".to_string(),
                     path: Some(PathBuf::from("/tmp/cargo")),
+                    path_candidates: vec![PathBuf::from("/tmp/cargo")],
                     current: Some("1.94.0".to_string()),
                     required: Some("stable".to_string()),
                     manager: Some("rustup".to_string()),
@@ -1177,8 +1635,10 @@ mod tests {
             ],
             issues: vec![Issue {
                 kind: crate::doctor::IssueKind::PathConflict,
+                severity: crate::doctor::IssueSeverity::Warning,
                 path: None,
                 message: "ignored".to_string(),
+                evidence: Vec::new(),
                 fix: None,
             }],
         };
@@ -1214,6 +1674,7 @@ mod tests {
             ),
             homebrew: None,
             npm: None,
+            ..DevkitConfig::default()
         };
         let report = DoctorReport {
             tools: vec![missing_tool("go")],
@@ -1229,6 +1690,52 @@ mod tests {
             go_step.command.as_deref(),
             Some("install Go 1.26.2 from https://go.dev/dl/ into ~/.local/opt/go/current")
         );
+    }
+
+    #[test]
+    fn winget_policy_adds_windows_package_manager_prerequisite() {
+        let config = DevkitConfig {
+            policy: None,
+            tools: Some(
+                [(
+                    "deno".to_string(),
+                    ToolPolicy {
+                        version: Some("latest".to_string()),
+                        manager: Some("winget".to_string()),
+                        ..ToolPolicy::default()
+                    },
+                )]
+                .into_iter()
+                .collect(),
+            ),
+            homebrew: None,
+            npm: None,
+            ..DevkitConfig::default()
+        };
+        let report = DoctorReport {
+            tools: vec![missing_tool("winget"), missing_tool("deno")],
+            issues: vec![],
+        };
+
+        let plan = build_sync_plan(true, Path::new("devkit.toml"), &config, &report);
+
+        assert!(plan.steps.iter().any(|step| {
+            step.id == "tool:winget"
+                && step.manual
+                && step
+                    .command
+                    .as_deref()
+                    .is_some_and(|command| command.contains("getwinget"))
+        }));
+        assert!(plan.steps.iter().any(|step| {
+            step.id == "tool:deno"
+                && step.manual
+                && step.blocked_by == vec!["tool:winget"]
+                && step
+                    .command
+                    .as_deref()
+                    .is_some_and(|command| command.contains("winget install"))
+        }));
     }
 
     #[test]
@@ -1315,6 +1822,7 @@ mod tests {
             name: name.to_string(),
             command: name.to_string(),
             path: None,
+            path_candidates: Vec::new(),
             current: None,
             required: None,
             manager: None,

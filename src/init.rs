@@ -8,6 +8,7 @@ use anyhow::{Context, Result, bail};
 
 use crate::{
     doctor::{DoctorReport, Status, ToolStatus},
+    platform::{OperatingSystem, current_platform_tag, path_contains as platform_path_contains},
     shell::command_path,
 };
 
@@ -16,8 +17,8 @@ const COMMON_BREW_PACKAGES: &[&str] = &[
 ];
 const COMMON_NPM_GLOBALS: &[&str] = &["wrangler"];
 const COMMON_TOOL_NAMES: &[&str] = &[
-    "fnm", "node", "npm", "pnpm", "yarn", "bun", "deno", "go", "rust", "uv", "python", "poetry",
-    "ruby", "wrangler",
+    "fnm", "nvm", "node", "npm", "pnpm", "yarn", "bun", "deno", "go", "rust", "uv", "python",
+    "poetry", "ruby", "wrangler",
 ];
 
 #[derive(Debug, Clone)]
@@ -31,10 +32,25 @@ pub struct InitWriteResult {
     pub overwritten: bool,
 }
 
+#[derive(Debug, Clone)]
+pub struct InitInteractiveOptions {
+    pub output: PathBuf,
+    pub force: bool,
+    pub stdout: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InitInteractionOutcome {
+    Continue,
+    Handled,
+    Cancelled,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InitDraft {
     pub policy: PolicyDraft,
     pub fnm: Option<SimpleToolDraft>,
+    pub nvm: Option<SimpleToolDraft>,
     pub node: Option<NodeDraft>,
     pub npm: Option<SimpleToolDraft>,
     pub pnpm: Option<SimpleToolDraft>,
@@ -101,9 +117,14 @@ pub struct NpmDraft {
 }
 
 pub fn build_init_draft(report: &DoctorReport) -> InitDraft {
+    let brew_packages = if OperatingSystem::current().is_macos() || command_path("brew").is_some() {
+        detect_installed_commands(COMMON_BREW_PACKAGES)
+    } else {
+        Vec::new()
+    };
     build_init_draft_with_inventory(
         report,
-        detect_installed_commands(COMMON_BREW_PACKAGES),
+        brew_packages,
         detect_installed_commands(COMMON_NPM_GLOBALS),
     )
 }
@@ -116,21 +137,28 @@ fn build_init_draft_with_inventory(
     InitDraft {
         policy: PolicyDraft {
             channel: "stable".to_string(),
-            platform: current_platform(),
+            platform: current_platform_tag(),
         },
         fnm: detect_fnm(report),
+        nvm: detect_nvm(report),
         node: detect_node(report),
         npm: detect_latest_tool(report, "npm", "npm"),
         pnpm: detect_latest_tool(report, "pnpm", "corepack"),
         yarn: detect_latest_tool(report, "yarn", "corepack"),
-        bun: detect_latest_tool(report, "bun", "brew"),
+        bun: detect_latest_tool(
+            report,
+            "bun",
+            OperatingSystem::current()
+                .default_manager_for("bun")
+                .unwrap_or("standalone"),
+        ),
         deno: detect_deno(report),
         go: detect_go(report),
         rust: detect_rust(report),
         uv: detect_latest_tool(report, "uv", "standalone"),
-        python: detect_homebrew_tool(report, "python"),
+        python: detect_python(report),
         poetry: detect_poetry(report),
-        ruby: detect_homebrew_tool(report, "ruby"),
+        ruby: detect_ruby(report),
         wrangler: detect_latest_tool(report, "wrangler", "npm"),
         cli: (!brew_packages.is_empty()).then_some(CliDraft {
             manager: "brew".to_string(),
@@ -145,16 +173,30 @@ fn build_init_draft_with_inventory(
     }
 }
 
-pub fn customize_init_draft_interactively(draft: &mut InitDraft) -> Result<bool> {
+pub fn customize_init_draft_interactively_with_options(
+    draft: &mut InitDraft,
+    options: InitInteractiveOptions,
+) -> Result<InitInteractionOutcome> {
     if std::io::stdin().is_terminal() && std::io::stderr().is_terminal() {
-        return crate::init_tui::customize_init_draft_tui(draft);
+        return crate::init_tui::customize_init_draft_tui(
+            draft,
+            crate::init_tui::InitTuiOptions {
+                output: options.output,
+                force: options.force,
+                stdout: options.stdout,
+            },
+        );
     }
 
     let stdin = std::io::stdin();
     let mut input = stdin.lock();
     let stderr = std::io::stderr();
     let mut output = stderr.lock();
-    customize_init_draft_with_io(draft, &mut input, &mut output)
+    if customize_init_draft_with_io(draft, &mut input, &mut output)? {
+        Ok(InitInteractionOutcome::Continue)
+    } else {
+        Ok(InitInteractionOutcome::Cancelled)
+    }
 }
 
 pub fn render_init_document(draft: &InitDraft) -> InitDocument {
@@ -165,6 +207,9 @@ pub fn render_init_document(draft: &InitDraft) -> InitDocument {
     sections.push(render_policy_section(&draft.policy));
 
     if let Some(section) = render_simple_tool("fnm", draft.fnm.as_ref(), Some("latest")) {
+        sections.push(section);
+    }
+    if let Some(section) = render_simple_tool("nvm", draft.nvm.as_ref(), Some("latest")) {
         sections.push(section);
     }
     if let Some(section) = render_node_tool(draft.node.as_ref()) {
@@ -304,6 +349,7 @@ fn prompt_selected_tool_details<R: BufRead, W: Write>(
     draft: &mut InitDraft,
 ) -> Result<()> {
     prompt_simple_tool(output, input, "fnm", &mut draft.fnm)?;
+    prompt_simple_tool(output, input, "nvm", &mut draft.nvm)?;
     prompt_node(output, input, &mut draft.node)?;
     prompt_simple_tool(output, input, "npm", &mut draft.npm)?;
     prompt_simple_tool(output, input, "pnpm", &mut draft.pnpm)?;
@@ -420,6 +466,7 @@ fn order_tool_names(selected: Vec<String>, choices: &[&str]) -> Vec<String> {
 fn tool_is_enabled(draft: &InitDraft, tool: &str) -> bool {
     match tool {
         "fnm" => draft.fnm.is_some(),
+        "nvm" => draft.nvm.is_some(),
         "node" => draft.node.is_some(),
         "npm" => draft.npm.is_some(),
         "pnpm" => draft.pnpm.is_some(),
@@ -439,7 +486,8 @@ fn tool_is_enabled(draft: &InitDraft, tool: &str) -> bool {
 
 fn set_tool_enabled(draft: &mut InitDraft, tool: &str, enabled: bool) {
     match tool {
-        "fnm" => set_simple_tool(&mut draft.fnm, enabled, "brew"),
+        "fnm" => set_simple_tool(&mut draft.fnm, enabled, default_manager("fnm")),
+        "nvm" => set_simple_tool(&mut draft.nvm, enabled, "standalone"),
         "node" => {
             if enabled {
                 draft.node.get_or_insert_with(default_node_draft);
@@ -450,8 +498,8 @@ fn set_tool_enabled(draft: &mut InitDraft, tool: &str, enabled: bool) {
         "npm" => set_simple_tool(&mut draft.npm, enabled, "npm"),
         "pnpm" => set_simple_tool(&mut draft.pnpm, enabled, "corepack"),
         "yarn" => set_simple_tool(&mut draft.yarn, enabled, "corepack"),
-        "bun" => set_simple_tool(&mut draft.bun, enabled, "brew"),
-        "deno" => set_simple_tool(&mut draft.deno, enabled, "brew"),
+        "bun" => set_simple_tool(&mut draft.bun, enabled, default_manager("bun")),
+        "deno" => set_simple_tool(&mut draft.deno, enabled, default_manager("deno")),
         "go" => {
             if enabled {
                 draft.go.get_or_insert_with(default_go_draft);
@@ -467,9 +515,9 @@ fn set_tool_enabled(draft: &mut InitDraft, tool: &str, enabled: bool) {
             }
         }
         "uv" => set_simple_tool(&mut draft.uv, enabled, "standalone"),
-        "python" => set_simple_tool(&mut draft.python, enabled, "brew"),
-        "poetry" => set_simple_tool(&mut draft.poetry, enabled, "brew"),
-        "ruby" => set_simple_tool(&mut draft.ruby, enabled, "brew"),
+        "python" => set_simple_tool(&mut draft.python, enabled, default_manager("python")),
+        "poetry" => set_simple_tool(&mut draft.poetry, enabled, default_manager("poetry")),
+        "ruby" => set_simple_tool(&mut draft.ruby, enabled, default_manager("ruby")),
         "wrangler" => set_simple_tool(&mut draft.wrangler, enabled, "npm"),
         _ => {}
     }
@@ -499,12 +547,20 @@ fn default_node_draft() -> NodeDraft {
 }
 
 fn default_go_draft() -> GoDraft {
+    let platform = OperatingSystem::current();
+    let source = platform.default_go_source();
     GoDraft {
         version: "stable".to_string(),
-        manager: "brew".to_string(),
-        source: "brew".to_string(),
-        install_dir: None,
+        manager: source.to_string(),
+        source: source.to_string(),
+        install_dir: (source == "official").then(|| "~/.local/opt/go/current".to_string()),
     }
+}
+
+fn default_manager(tool: &str) -> &'static str {
+    OperatingSystem::current()
+        .default_manager_for(tool)
+        .unwrap_or("manual")
 }
 
 fn default_rust_draft() -> RustDraft {
@@ -833,25 +889,26 @@ fn render_npm_section(npm: Option<&NpmDraft>) -> Option<String> {
 
 fn detect_fnm(report: &DoctorReport) -> Option<SimpleToolDraft> {
     let tool = installed_tool(report, "fnm")?;
-    if path_contains(tool, "/homebrew/") || path_contains(tool, "/opt/homebrew/") {
+    if is_homebrew_tool(tool) {
         return Some(SimpleToolDraft {
             manager: "brew".to_string(),
         });
     }
-    None
+    Some(SimpleToolDraft {
+        manager: default_manager("fnm").to_string(),
+    })
 }
 
 fn detect_node(report: &DoctorReport) -> Option<NodeDraft> {
     let tool = installed_tool(report, "node")?;
-    let manager = if path_contains(tool, "fnm") {
+    let manager = if tool_path_contains(tool, "fnm") {
         "fnm"
-    } else if path_contains(tool, "/homebrew/")
-        || path_contains(tool, "/opt/homebrew/")
-        || path_contains(tool, "/usr/local/")
-    {
+    } else if tool_path_contains(tool, "/.nvm/") || tool_path_contains(tool, "/nvm/") {
+        "nvm"
+    } else if is_homebrew_tool(tool) {
         "brew"
     } else {
-        return None;
+        default_manager("node")
     };
     let version = node_policy_version(tool.current.as_deref()?);
 
@@ -862,12 +919,21 @@ fn detect_node(report: &DoctorReport) -> Option<NodeDraft> {
     })
 }
 
+fn detect_nvm(report: &DoctorReport) -> Option<SimpleToolDraft> {
+    let node = installed_tool(report, "node")?;
+    (tool_path_contains(node, "/.nvm/") || tool_path_contains(node, "/nvm/")).then_some(
+        SimpleToolDraft {
+            manager: "standalone".to_string(),
+        },
+    )
+}
+
 fn detect_go(report: &DoctorReport) -> Option<GoDraft> {
     let tool = installed_tool(report, "go")?;
     let version = tool.current.as_deref()?.to_string();
     let path = tool.path.as_ref()?;
 
-    if path_contains(tool, "/homebrew/") || path_contains(tool, "/opt/homebrew/") {
+    if is_homebrew_tool(tool) {
         return Some(GoDraft {
             version,
             manager: "brew".to_string(),
@@ -887,7 +953,7 @@ fn detect_go(report: &DoctorReport) -> Option<GoDraft> {
 
 fn detect_rust(report: &DoctorReport) -> Option<RustDraft> {
     let rustc = installed_tool(report, "rustc")?;
-    if !path_contains(rustc, "cargo") && !path_contains(rustc, "rustup") {
+    if !tool_path_contains(rustc, "cargo") && !tool_path_contains(rustc, "rustup") {
         return None;
     }
     Some(RustDraft {
@@ -902,10 +968,14 @@ fn detect_latest_tool(report: &DoctorReport, name: &str, manager: &str) -> Optio
     })
 }
 
-fn detect_homebrew_tool(report: &DoctorReport, name: &str) -> Option<SimpleToolDraft> {
-    let tool = installed_tool(report, name)?;
-    is_homebrew_tool(tool).then_some(SimpleToolDraft {
-        manager: "brew".to_string(),
+fn detect_python(report: &DoctorReport) -> Option<SimpleToolDraft> {
+    let tool = installed_tool(report, "python")?;
+    Some(SimpleToolDraft {
+        manager: if is_homebrew_tool(tool) {
+            "brew".to_string()
+        } else {
+            default_manager("python").to_string()
+        },
     })
 }
 
@@ -916,6 +986,17 @@ fn detect_deno(report: &DoctorReport) -> Option<SimpleToolDraft> {
             "brew".to_string()
         } else {
             "standalone".to_string()
+        },
+    })
+}
+
+fn detect_ruby(report: &DoctorReport) -> Option<SimpleToolDraft> {
+    let tool = installed_tool(report, "ruby")?;
+    Some(SimpleToolDraft {
+        manager: if is_homebrew_tool(tool) {
+            "brew".to_string()
+        } else {
+            default_manager("ruby").to_string()
         },
     })
 }
@@ -981,24 +1062,16 @@ fn node_policy_version(version: &str) -> String {
     }
 }
 
-fn current_platform() -> String {
-    let arch = match std::env::consts::ARCH {
-        "aarch64" => "arm64",
-        other => other,
-    };
-    format!("{}-{arch}", std::env::consts::OS)
-}
-
 fn is_homebrew_tool(tool: &ToolStatus) -> bool {
-    path_contains(tool, "/homebrew/")
-        || path_contains(tool, "/opt/homebrew/")
-        || path_contains(tool, "/usr/local/")
-}
-
-fn path_contains(tool: &ToolStatus, pattern: &str) -> bool {
     tool.path
         .as_ref()
-        .is_some_and(|path| path.to_string_lossy().contains(pattern))
+        .is_some_and(|path| OperatingSystem::current().homebrew_path_matches(path))
+}
+
+fn tool_path_contains(tool: &ToolStatus, pattern: &str) -> bool {
+    tool.path
+        .as_ref()
+        .is_some_and(|path| platform_path_contains(path, &[pattern]))
 }
 
 #[cfg(test)]
@@ -1067,6 +1140,27 @@ mod tests {
         );
         assert!(document.content.contains("[tools.rustc]"));
         assert!(document.content.contains("[tools.cargo]"));
+    }
+
+    #[test]
+    fn detects_nvm_managed_node_in_generated_config() {
+        let report = DoctorReport {
+            tools: vec![installed_tool(
+                "node",
+                "/Users/test/.nvm/versions/node/v24.15.0/bin/node",
+                "24.15.0",
+            )],
+            issues: vec![],
+        };
+
+        let draft = build_init_draft_with_inventory(&report, Vec::new(), Vec::new());
+        let document = render_init_document(&draft);
+
+        assert_eq!(draft.nvm.as_ref().unwrap().manager, "standalone");
+        assert_eq!(draft.node.as_ref().unwrap().manager, "nvm");
+        assert!(document.content.contains("[tools.nvm]"));
+        assert!(document.content.contains("[tools.node]"));
+        assert!(document.content.contains("manager = \"nvm\""));
     }
 
     #[test]
@@ -1164,6 +1258,7 @@ mod tests {
             fnm: Some(super::SimpleToolDraft {
                 manager: "brew\"tap".to_string(),
             }),
+            nvm: None,
             node: None,
             npm: None,
             pnpm: None,
@@ -1218,6 +1313,7 @@ mod tests {
             name: name.to_string(),
             command: name.to_string(),
             path: Some(PathBuf::from(path)),
+            path_candidates: vec![PathBuf::from(path)],
             current: Some(version.to_string()),
             required: None,
             manager: None,

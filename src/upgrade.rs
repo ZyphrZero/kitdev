@@ -1,8 +1,10 @@
 use serde::Serialize;
 
 use crate::{
+    config::ToolPolicy,
     doctor::{DoctorReport, Status, ToolStatus, version_satisfies},
-    latest::{LatestVersion, lookup_latest},
+    latest::{LatestVersion, lookup_latest_for},
+    tool_command::{ToolCommand, command_for_tool},
 };
 
 #[derive(Debug, Serialize)]
@@ -27,7 +29,7 @@ pub fn build_upgrade_plan(dry_run: bool, check_latest: bool, report: &DoctorRepo
     let mut candidates = Vec::new();
 
     for tool in &report.tools {
-        let latest = check_latest.then(|| lookup_latest(&tool.name));
+        let latest = check_latest.then(|| lookup_latest_for(&tool.name, tool.manager.as_deref()));
         let target = upgrade_target(tool, latest.as_ref());
         let should_upgrade = should_upgrade(tool, target.as_deref());
 
@@ -108,20 +110,68 @@ fn upgrade_note(tool: &ToolStatus, latest: Option<&LatestVersion>, target: Optio
 }
 
 fn upgrade_command(tool: &ToolStatus, target: Option<&str>) -> Option<String> {
-    match tool.name.as_str() {
-        "fnm" | "bun" | "deno" | "python" | "poetry" | "ruby" | "brew" => {
-            Some(format!("brew upgrade {}", tool.name))
+    if matches!(tool.name.as_str(), "rustup" | "rustc" | "cargo") {
+        if matches!(tool.status, Status::Missing) {
+            let policy = ToolPolicy {
+                version: target.map(ToString::to_string),
+                manager: tool.manager.clone().or_else(|| Some("rustup".to_string())),
+                source: tool.manager.clone().or_else(|| Some("rustup".to_string())),
+                ..ToolPolicy::default()
+            };
+            return command_for_tool("rust", &policy, true)
+                .ok()
+                .map(|command| match command {
+                    ToolCommand::Shell(command) | ToolCommand::Manual(command) => command,
+                });
         }
-        "node" => target.map(|version| format!("fnm install {version} && fnm default {version}")),
-        "npm" => Some("npm install -g npm@latest".to_string()),
-        "pnpm" => Some("corepack prepare pnpm@latest --activate".to_string()),
-        "yarn" => Some("corepack prepare yarn@stable --activate".to_string()),
-        "wrangler" => Some("npm install -g wrangler@latest".to_string()),
-        "uv" => Some("uv self update".to_string()),
-        "rustup" | "rustc" | "cargo" => {
-            Some("rustup self update && rustup update stable".to_string())
-        }
-        "go" => target.map(|version| format!("install Go {version} from https://go.dev/dl/")),
-        _ => None,
+        return Some("rustup self update && rustup update stable".to_string());
+    }
+
+    let install = matches!(tool.status, Status::Missing)
+        || tool.note.as_deref() == Some("installed path does not match configured manager");
+    let policy = ToolPolicy {
+        version: target.map(ToString::to_string),
+        manager: tool.manager.clone(),
+        source: tool.manager.clone(),
+        ..ToolPolicy::default()
+    };
+
+    command_for_tool(&tool.name, &policy, install)
+        .ok()
+        .map(|command| match command {
+            ToolCommand::Shell(command) | ToolCommand::Manual(command) => command,
+        })
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::doctor::{DoctorReport, Status, ToolStatus};
+
+    use super::build_upgrade_plan;
+
+    #[test]
+    fn missing_tools_use_install_commands() {
+        let report = DoctorReport {
+            tools: vec![ToolStatus {
+                name: "deno".to_string(),
+                command: "deno".to_string(),
+                path: None,
+                path_candidates: Vec::new(),
+                current: None,
+                required: Some("latest".to_string()),
+                manager: Some("brew".to_string()),
+                status: Status::Missing,
+                note: Some("command not found in PATH".to_string()),
+            }],
+            issues: Vec::new(),
+        };
+
+        let plan = build_upgrade_plan(true, false, &report);
+
+        assert_eq!(plan.candidates.len(), 1);
+        assert_eq!(
+            plan.candidates[0].command.as_deref(),
+            Some("brew install deno")
+        );
     }
 }

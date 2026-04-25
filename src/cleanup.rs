@@ -2,6 +2,8 @@ use std::path::{Path, PathBuf};
 
 use serde::Serialize;
 
+use crate::platform::{OperatingSystem, home_path};
+
 #[derive(Debug, Serialize)]
 pub struct CleanupPlan {
     pub dry_run: bool,
@@ -17,26 +19,7 @@ pub struct CleanupItem {
 }
 
 pub fn build_cleanup_plan(dry_run: bool) -> CleanupPlan {
-    let candidates = [
-        (
-            PathBuf::from("/usr/local/go"),
-            "legacy official Go install",
-            "sudo rm -rf /usr/local/go",
-            true,
-        ),
-        (
-            PathBuf::from("/usr/local/lib/node_modules"),
-            "legacy global Node modules",
-            "sudo rm -rf /usr/local/lib/node_modules",
-            true,
-        ),
-        (
-            home_path(".nvm"),
-            "legacy nvm directory",
-            "rm -rf ~/.nvm",
-            false,
-        ),
-    ];
+    let candidates = cleanup_candidates(OperatingSystem::current());
 
     let items = candidates
         .into_iter()
@@ -52,13 +35,83 @@ pub fn build_cleanup_plan(dry_run: bool) -> CleanupPlan {
     CleanupPlan { dry_run, items }
 }
 
+fn cleanup_candidates(platform: OperatingSystem) -> Vec<(PathBuf, &'static str, String, bool)> {
+    match platform {
+        OperatingSystem::Windows => vec![
+            (
+                windows_appdata_path("nvm"),
+                "legacy nvm directory",
+                "Remove-Item -Recurse -Force $env:APPDATA\\nvm".to_string(),
+                false,
+            ),
+            (
+                home_path("AppData/Roaming/npm"),
+                "legacy global npm bin directory",
+                "Remove-Item -Recurse -Force $env:APPDATA\\npm".to_string(),
+                false,
+            ),
+        ],
+        OperatingSystem::Macos | OperatingSystem::Linux | OperatingSystem::Other => vec![
+            (
+                PathBuf::from("/usr/local/go"),
+                "legacy official Go install",
+                "sudo rm -rf /usr/local/go".to_string(),
+                true,
+            ),
+            (
+                PathBuf::from("/usr/local/lib/node_modules"),
+                "legacy global Node modules",
+                "sudo rm -rf /usr/local/lib/node_modules".to_string(),
+                true,
+            ),
+            (
+                home_path(".nvm"),
+                "legacy nvm directory",
+                "rm -rf ~/.nvm".to_string(),
+                false,
+            ),
+        ],
+    }
+}
+
 fn path_exists(path: impl AsRef<Path>) -> bool {
     std::fs::symlink_metadata(path).is_ok()
 }
 
-fn home_path(path: impl AsRef<Path>) -> PathBuf {
-    std::env::var_os("HOME")
+fn windows_appdata_path(path: &str) -> PathBuf {
+    std::env::var_os("APPDATA")
         .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("~"))
+        .unwrap_or_else(|| home_path("AppData/Roaming"))
         .join(path)
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::platform::OperatingSystem;
+
+    use super::cleanup_candidates;
+
+    #[test]
+    fn builds_windows_cleanup_commands() {
+        let candidates = cleanup_candidates(OperatingSystem::Windows);
+
+        assert!(
+            candidates
+                .iter()
+                .any(|(_, _, command, _)| command.contains("Remove-Item"))
+        );
+    }
+
+    #[test]
+    fn builds_unix_cleanup_commands() {
+        let candidates = cleanup_candidates(OperatingSystem::Linux);
+
+        assert!(
+            candidates
+                .iter()
+                .any(|(path, _, command, requires_sudo)| path.ends_with("go")
+                    && command == "sudo rm -rf /usr/local/go"
+                    && *requires_sudo)
+        );
+    }
 }

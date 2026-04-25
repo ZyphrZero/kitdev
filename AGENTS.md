@@ -24,6 +24,14 @@ Follow `rustfmt` defaults: 4-space indentation, conventional import grouping, an
 
 Keep fast unit tests near the code they cover using `#[cfg(test)] mod tests`, as shown in `src/doctor.rs`. Name tests after expected behavior, for example `supports_policy_version_matching`. Add integration tests under `tests/` when a change needs to exercise CLI behavior, output formats, or multiple modules together. Run `cargo test` before opening a PR.
 
+## TUI Development Guidelines
+
+Interactive TUI flows must stay inside the alternate screen until the user explicitly exits with `Q`, `Ctrl-C`, or a clearly labeled finish action. Do not use `Esc` as a destructive close, cancel, or quit shortcut in the main screen, preview screen, popups, or pickers, because some terminals can deliver arrow-key prefixes as `Esc`. Treat `Esc` as ignored or as a non-destructive hint unless a future input layer can reliably disambiguate it.
+
+Any command launched while the TUI is active must not read from the terminal. Prefer direct `Command` execution over an interactive shell. When a shell fallback is necessary, run it non-interactively, set `stdin(Stdio::null())`, and suppress or capture output so background work cannot suspend the process with tty input.
+
+When changing TUI navigation, version pickers, action popups, or background tasks, add regression tests that prove subviews do not exit on `Esc` or arrow-key input and that long-running actions return results to the TUI instead of dropping back to the CLI. Manually smoke-test at least `cargo run -- new -i -p`, opening a subview and using arrow keys before exiting with `Q` or the finish action.
+
 ## Commit & Pull Request Guidelines
 
 The current history uses short, descriptive commit messages such as `Initial devkit MVP`; continue with concise imperative or summary-style messages that explain the change. Keep unrelated cleanup out of feature commits.
