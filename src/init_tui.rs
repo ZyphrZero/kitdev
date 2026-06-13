@@ -8,7 +8,7 @@ use std::{
 
 use anyhow::{Context, Result};
 use crossterm::{
-    event::{self, Event, KeyCode, KeyEvent, KeyModifiers},
+    event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers},
     execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
@@ -317,6 +317,7 @@ fn run_tui(
             .unwrap_or_default();
         if event::poll(timeout)?
             && let Event::Key(key) = event::read()?
+            && is_action_key_event(key)
             && let Some(exit) = app.handle_key(key)
         {
             match exit {
@@ -336,6 +337,10 @@ fn run_tui(
             last_tick = Instant::now();
         }
     }
+}
+
+fn is_action_key_event(key: KeyEvent) -> bool {
+    matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat)
 }
 
 fn tui_text(messages: Messages, text: TuiText) -> &'static str {
@@ -3712,7 +3717,7 @@ mod tests {
         time::{SystemTime, UNIX_EPOCH},
     };
 
-    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
     use ratatui::style::Color;
     use ratatui::text::Line;
 
@@ -3729,8 +3734,9 @@ mod tests {
     use super::{
         ActionOutput, AppExit, FieldTarget, Focus, InitTuiApp, InitTuiOptions, MenuEntry,
         VersionPickerState, action_field_rows, action_menu_index, action_output_line_count,
-        apply_field_edit, default_node_draft, doctor_output, field_rows, menu_entries, move_index,
-        parse_list, set_tool_enabled, styled_action_output_line, sync_plan_output, tool_enabled,
+        apply_field_edit, default_node_draft, doctor_output, field_rows, is_action_key_event,
+        menu_entries, move_index, parse_list, set_tool_enabled, styled_action_output_line,
+        sync_plan_output, tool_enabled,
     };
 
     #[test]
@@ -4031,6 +4037,19 @@ mod tests {
         app.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
 
         assert_eq!(app.menu_index, menu_entries().len() - 1);
+    }
+
+    #[test]
+    fn terminal_key_release_events_are_not_actions() {
+        let release =
+            KeyEvent::new_with_kind(KeyCode::Down, KeyModifiers::NONE, KeyEventKind::Release);
+        let press = KeyEvent::new_with_kind(KeyCode::Down, KeyModifiers::NONE, KeyEventKind::Press);
+        let repeat =
+            KeyEvent::new_with_kind(KeyCode::Down, KeyModifiers::NONE, KeyEventKind::Repeat);
+
+        assert!(!is_action_key_event(release));
+        assert!(is_action_key_event(press));
+        assert!(is_action_key_event(repeat));
     }
 
     #[test]
